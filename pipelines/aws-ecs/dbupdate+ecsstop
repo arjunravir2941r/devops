@@ -1,0 +1,422 @@
+#!groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def nexusUrl = "url"
+
+//def nexusUrl = "https://nexus.t6cloud.com"
+def queryUrl = "${nexusUrl}/service/rest/v1/search?repository=t6hs-snapshots&group=com.t6hs&name="
+def queryUrlreleases = "${nexusUrl}/service/rest/v1/search?repository=t6hs-releases&group=com.t6hs&name="
+def queryUrlmeta = "${nexusUrl}/service/rest/v1/search?repository=t6hs-releases&group=com.t6hs&name="
+
+def t6RepoUrl = "${nexusUrl}/repository/t6hs-releases"
+def metadataVersions = ['n/a']
+def dbtoolsVersions = ['n/a']
+def baseVersions
+def originalDbtoolsVersion
+def combinedVersions
+
+def envs = ['n/a']
+
+@Library(['sortVersions', 'getNexusArtifactVersions', 'getNexusArtifactZipFilesPath']) _
+
+node('AWS-AGENT1') {
+script {
+
+        def metadataVer = getNexusArtifactVersions("${queryUrlmeta}t6-metadata")
+        metadataVersions = metadataVer.sort().reverse()
+
+        def dbtoolsVer = getNexusArtifactVersions("${queryUrl}t6-dbtools")
+        dbtoolsVersions = dbtoolsVer.sort().reverse()
+        
+        def dbtoolsVerReleases = getNexusArtifactVersions("${queryUrlreleases}t6-dbtools")
+        dbtoolsVersionsReleases = dbtoolsVerReleases.sort().reverse()
+
+        def versionString = dbtoolsVersions
+
+        baseVersions = versionString.collect { version ->
+            version.replaceAll("-(?=[^-]*-[^-]*\$).*", "-SNAPSHOT")
+        }
+     
+        echo "baseVersions: $baseVersions"
+
+
+        if ("${params.environment}" != 'n/a') {
+            envs = [params.environment]
+        }
+        
+        def dbtoolsZipFiles = getNexusArtifactZipFilesPath("${queryUrl}t6-dbtools")
+        dbtoolsZipFilesPaths = dbtoolsZipFiles.sort().reverse()
+        echo "dbtoolsZipFilesPaths: $dbtoolsZipFilesPaths"
+        
+        // Find the original dbtoolsVersion based on the selected baseVersion
+        def selectedBaseVersion = params.dbtoolsVersion.replaceAll("-SNAPSHOT", "")
+        originalDbtoolsVersion = dbtoolsVersions.find { it.contains(selectedBaseVersion) }
+
+        combinedVersions = baseVersions + dbtoolsVersionsReleases
+
+        echo "Original dbtoolsVersion: $originalDbtoolsVersion"
+        echo "DBTOOLS_VERSION: ${params.dbtoolsVersion}"
+    }
+}
+
+def determineDatabaseDetails() {
+    def dbConfig = [:]
+    switch (params.databaseType) {
+        case 'SQL Server':
+            dbConfig.url = "t6-internal-rds.chlyypksqpgf.us-east-1.rds.amazonaws.com"
+            dbConfig.jdbcUrl = "jdbc:sqlserver://${dbConfig.url}"
+            dbConfig.commandTool = "sqlcmd -S"
+            break
+        case 'PostgreSQL':
+            dbConfig.url = "t6-dev-rds-psql.chlyypksqpgf.us-east-1.rds.amazonaws.com"
+            dbConfig.jdbcUrl = "jdbc:postgresql"
+            dbConfig.commandTool = "psql -h "
+            break
+    }
+    return dbConfig
+}
+
+
+pipeline {
+    agent { label 'aws-agent1' }
+
+    parameters{
+        choice name: 'parameterize',
+            choices: ['Yes', 'No'],
+            description: "Do you wish to do a dry run to grab/update parameters?\n" +
+                    " - It is recommended to run with in this mode before deploy"
+        
+        choice name: 'databaseType',
+            choices: ['SQL Server', 'PostgreSQL'],
+            description: 'Select the database type'
+
+        choice name: 'metadataVersion',
+            choices: metadataVersions,
+            description: 'Metadata-version'
+
+        choice name: 'dbtoolsVersion',
+            choices: combinedVersions,
+            description: 'DBtool-version'
+        
+        choice name: 'dbstrategy', 
+            choices: ['true', 'false'], 
+            description: 'Create new: true / Upgrade existing: false'
+                
+        string(name: 'dbname', 
+            defaultValue: 'null', 
+            description: 'Give database Name, e.g. dev1, node20')
+
+        choice name: 'userset', 
+            choices: ['ad-AzureMedical', 'ad-AzureDev', 'ad-JOMIS', 'ad-JOMIS-ALL', 'ad-JOMIS-F-ALL', 'ad-JOMIS-DEV', 'ad-JOMIS-F-DEV', 'ad-JOMIS-ADMIN'], 
+            description: 'Choose the userset'
+
+        
+        
+        choice name: 'Central_Database',
+            choices: ['No', 'Yes'],
+            description: 'Select Yes IF you want to create database for central'
+
+
+        booleanParam(
+            name: 'confirmParameters',
+            defaultValue: false,
+            description: 'Confirm the selected parameters before proceeding'
+        )
+    }
+
+    environment {
+        DIRECTORY = 'db-provisioning'
+        NEXUS_URL = 'url'
+        DBTOOLS_VERSION = "${params.dbtoolsVersion}"
+        METADATA_VERSION = "${params.metadataVersion}"
+        DB_STRATEGY = "${params.dbstrategy}"
+        DB_NAME = "${params.dbname}"
+        USER_SET = "${params.userset}"
+        AWS_DEFAULT_REGION="us-east-1"
+        AWS_REGION = "us-east-1"
+        AWS_CREDENTIALS_Jenkins=credentials('aws-creds')
+        
+    }
+    options {
+        checkoutToSubdirectory "db-provisioning"
+        ansiColor('xterm')
+    }
+    tools {
+        jdk 'java17'
+    }
+    stages {
+
+        stage('Echo Database Configuration') {
+            steps {
+                script {
+  
+                    def dbConfig = determineDatabaseDetails()
+
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                        echo "Database Type: ${params.databaseType}"
+                        echo "Database URL: ${dbConfig.url}"
+                        echo "JDBC URL: ${dbConfig.jdbcUrl}"
+                        echo "JDBC command tool :${dbConfig.commandTool} "
+
+                    }
+                }
+            }
+        }
+
+
+        stage("Parameterizing Job") {
+        
+            steps {
+                script {
+                    if ("${params.parameterize}" == "Yes") {
+                        currentBuild.result = 'ABORTED'
+                        error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+                    }
+                }
+            }
+        }
+        stage('Start Build Notification') {
+            steps {
+                slackSend channel: '#backend-releases',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+        
+        stage('Delete Existing Resources') {
+            
+            steps {
+                script {
+                    echo "Deleting existing resources..."
+
+                    // Delete ECS service
+                    def ecsServiceName = "${params.dbname}-service" // Substituted ecsServiceName
+
+                    // Check if the service exists
+                    def serviceExists = sh(script: """
+                        aws ecs describe-services --cluster t6-ecs-dev --services ${ecsServiceName} --region ${AWS_REGION} --query 'services[0].status' --output text
+                    """, returnStdout: true).trim()
+                    //def updateServiceResult
+                    if (serviceExists != 'ACTIVE') {
+                        echo "ECS service ${ecsServiceName} does not exist. Nothing to delete."
+                        
+                    } else {
+                        // Update service to have a desired count of 0
+                        sh """
+                            aws ecs update-service \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service ${ecsServiceName} \
+                                --desired-count 0
+                        """
+
+                        // Get task ARNs
+                        def taskArns = sh(script: """
+                            aws ecs list-tasks \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service-name ${ecsServiceName} \
+                                --query 'taskArns' \
+                                --output text
+                        """, returnStdout: true).trim()
+
+                        // Stop each task
+                        if (taskArns) {
+                            taskArns.split().each { taskArn ->
+                                def taskId = taskArn.tokenize('/').last()
+                                sh """
+                                    aws ecs stop-task \
+                                        --region ${AWS_REGION} \
+                                        --cluster t6-ecs-dev \
+                                        --task ${taskId}
+                                """
+                            }
+
+                            // Wait for all tasks to be stopped
+                            echo "Waiting for tasks to be stopped..."
+                            sh """
+                                aws ecs wait tasks-stopped \
+                                    --region ${AWS_REGION} \
+                                    --cluster t6-ecs-dev \
+                                    --tasks ${taskArns}
+                            """
+                        }
+
+                        // Delete ECS service
+                        echo "Deleting existing ECS service..."
+                        sh """
+                            aws ecs delete-service \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service ${ecsServiceName} \
+                                --force
+                        """
+
+                        // Wait for Service to Drain
+                        sh """
+                            aws ecs wait services-inactive \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --services ${ecsServiceName} 
+                        """
+                        echo "Services have stabilized."
+
+                       
+
+                    }
+                }
+            }
+        }
+
+        stage("Check and Create Database") {
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                        if (params.databaseType == 'SQL Server') {
+                            // SQL Server command
+                            def listDatabasesCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"SELECT name FROM sys.databases WHERE name = '${params.dbname}'\""
+                            def dbListOutput = sh(script: listDatabasesCmd, returnStdout: true).trim()
+                            boolean dbExists = dbListOutput.split('\n').any { line -> line.trim().equalsIgnoreCase(params.dbname) }
+                            if (dbExists) {
+                                echo "Database '${params.dbname}' already exists."
+                            } else {
+                                echo "Database '${params.dbname}' does not exist. Creating..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"CREATE DATABASE ${params.dbname}\""
+                            }
+                        } else if (params.databaseType == 'PostgreSQL') {
+                            // PostgreSQL command
+                            // Temporarily set PGPASSWORD for the duration of this script block
+                            withEnv(["PGPASSWORD=${DB_PASS}"]) {
+                                def checkDbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"SELECT 1 FROM pg_database WHERE datname='${params.dbname}';\""
+                                def dbExistsOutput = sh(script: checkDbExistsCmd, returnStdout: true).trim()
+                                boolean dbExists = dbExistsOutput.contains("1")
+                                if (dbExists) {
+                                    echo "Database '${params.dbname}' already exists."
+                                } else {
+                                    echo "Database '${params.dbname}' does not exist. Creating..."
+                                    sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"CREATE DATABASE ${params.dbname};\""
+                                }
+                            }
+                            // PGPASSWORD will be automatically unset after the withEnv block
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+
+
+        stage("Check, Delete, and Recreate Central Database") {
+            when {
+                expression { params.Central_Database == 'Yes' }
+            }
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                        def centralDbName = "central_${params.dbname}"
+                        echo "Processing Central Database: ${centralDbName}"
+
+                        if (params.databaseType == 'SQL Server') {
+                            // SQL Server commands for checking, deleting, and creating the central database
+                            def dbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"SELECT name FROM sys.databases WHERE name = '${centralDbName}'\""
+                            def dbExists = sh(script: dbExistsCmd, returnStdout: true).trim()
+
+                            if (dbExists.contains(centralDbName)) {
+                                echo "Central Database '${centralDbName}' exists. Deleting..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"DROP DATABASE ${centralDbName}\""
+                            }
+
+                            echo "Creating Central Database '${centralDbName}'..."
+                            sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"CREATE DATABASE ${centralDbName}\""
+
+                        } else if (params.databaseType == 'PostgreSQL') {
+                            // PostgreSQL commands for checking, deleting, and creating the central database
+                            withEnv(["PGPASSWORD=${DB_PASS}"]) {
+                                def checkDbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"SELECT 1 FROM pg_database WHERE datname='${centralDbName}';\""
+                                def dbExistsOutput = sh(script: checkDbExistsCmd, returnStdout: true).trim()
+                                boolean dbExists = dbExistsOutput.contains("1")
+
+                                if (dbExists) {
+                                    echo "Central Database '${centralDbName}' exists. Deleting..."
+                                    sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"DROP DATABASE IF EXISTS ${centralDbName};\""
+                                }
+
+                                echo "Creating Central Database '${centralDbName}'..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"CREATE DATABASE ${centralDbName};\""
+                            }
+                            // PGPASSWORD will be automatically unset after the withEnv block
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+
+        stage('DB-Updation') {
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    dir("$DIRECTORY") {
+                        withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                            println("Building db ")
+                            if (params.dbtoolsVersion.contains("SNAPSHOT")) {
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-snapshots/com/t6hs/t6-dbtools/${DBTOOLS_VERSION}/t6-dbtools-${originalDbtoolsVersion}.zip"
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${METADATA_VERSION}/t6-metadata-${METADATA_VERSION}.zip"
+                                sh script: "unzip t6-dbtools-${originalDbtoolsVersion}.zip"
+                            } else {
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-dbtools/${DBTOOLS_VERSION}/t6-dbtools-${DBTOOLS_VERSION}.zip"
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${METADATA_VERSION}/t6-metadata-${METADATA_VERSION}.zip"
+                                sh script: "unzip t6-dbtools-${DBTOOLS_VERSION}.zip"
+                            }
+
+                            def inDirPath = "t6-dbtools-${DBTOOLS_VERSION}/in"
+                            if (fileExists(inDirPath)) {
+                                sh "rm -rf ${inDirPath}/*"
+                            } else {
+                                sh "mkdir ${inDirPath}"
+                            }
+                            sh "cp t6-metadata-${METADATA_VERSION}.zip t6-dbtools-${DBTOOLS_VERSION}/in/"
+                            sh "mv t6-dbtools-${DBTOOLS_VERSION}/in/t6-metadata-${METADATA_VERSION}.zip t6-dbtools-${DBTOOLS_VERSION}/in/metadata-6.zip"
+                            dir("t6-dbtools-${DBTOOLS_VERSION}") {
+                                if (params.databaseType == 'SQL Server') {
+                                    // Use SQL Server JDBC URL format
+                                    sh "java -jar ./lib/t6-dbtools-${DBTOOLS_VERSION}.jar --metadata-directory ./in/ --database ${DB_NAME} --authentication-type jdbc-url --mapping-file ${USER_SET} --full-deployment --datasource-url '${dbConfig.jdbcUrl};username=${DB_USER};password=${DB_PASS};databaseName=${DB_NAME};trustServerCertificate=true;'"
+                                } else if (params.databaseType == 'PostgreSQL') {
+                                    // Use PostgreSQL JDBC URL format
+                                    def jdbcUrl = "jdbc:postgresql://${dbConfig.url}:5432/${DB_NAME}?user=${DB_USER}&password=${DB_PASS}&currentSchema=dbo"
+                                    sh "java -jar ./lib/t6-dbtools-${DBTOOLS_VERSION}.jar --metadata-directory ./in/ --database ${DB_NAME} --authentication-type jdbc-url --mapping-file ${USER_SET} --full-deployment --datasource-url '${jdbcUrl}'"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+    }
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend channel: '#backend-releases',
+                color: '#73c990',
+                message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed."
+        }
+        failure {
+            slackSend channel: '#backend-releases',
+                color: '#d54c53',
+                message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed."
+        }
+    }
+
+}
