@@ -1,0 +1,11 @@
+version: '3'
+services:
+    myconnect:
+        image: nextgenhealthcare/connect:4.2
+        ports:
+            - "8443:8443"
+            - "8083:8080"
+            - "8095:8095"
+        volumes:
+            - "/home/t6admin/mirthconnect/:/app/mirthconnect"
+        container_name: mirthconnect
