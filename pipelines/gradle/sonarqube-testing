@@ -1,0 +1,107 @@
+#!groovy
+
+@Library(['sortVersions','getChanges']) _
+
+pipeline {
+
+    agent { label 'test' }
+
+    environment {
+        DIRECTORY = 't6-admin'
+        CHANGES = ''
+        AUTHOR = ''
+    }
+
+    options {
+        checkoutToSubdirectory "t6-admin"
+        ansiColor('xterm')
+    }
+    tools {
+        jdk 'java17'
+    }
+
+    stages {
+        
+        stage('Configure Git attributes') {
+            steps {
+                sh script: 'git config --global user.email "jenkins@t6hs.com"'
+                sh script: 'git config --global user.name "Jenkins"'
+            }
+        }
+
+        stage('Start Notification') {
+            steps {
+                script {
+                    dir("$DIRECTORY") {
+                        AUTHOR = sh script: "git show -s --pretty=\"%an <%ae>\" ${GIT_COMMIT}", returnStdout: true
+                        CHANGES = getChanges()
+                        slackSend channel: '#backend-testing',
+                                color: '#3399ff',
+                                message: "STARTING: Pipeline ${currentBuild.fullDisplayName} by: ${AUTHOR}\n" +
+                                        "Changes:\n" +
+                                        "${CHANGES}\n" +
+                                        "More info at: ${env.BUILD_URL}"
+                    }
+                }
+            }
+        }
+
+        stage('Setting Gradle Wrapper permissions') {
+            steps {
+                dir("$DIRECTORY") {
+                    sh 'chmod 777 gradlew'
+                }
+            }
+        }
+
+        stage('Gradle Test & Sonarqube Analysis') {
+            steps {
+                withSonarQubeEnv('Sonarqube') {
+                    dir("$DIRECTORY") {
+                        sh 'GRADLE_OPTS="-Xmx1024m" ./gradlew clean sonarqube --no-daemon --debug'
+                    }
+                }
+            }
+        }
+
+        stage('Sonar Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir("$DIRECTORY") {
+                junit skipPublishingChecks: true, testResults: 'build/test-results/**/*.xml'
+
+            }
+        }
+        success {
+            slackSend channel: '#backend-testing',
+                    color: '#52BE80',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName} by: ${AUTHOR}\n" +
+                            "More info at: ${env.BUILD_URL}"
+        }
+        failure {
+
+            slackSend channel: '#backend-testing',
+                    color: '#C0392B',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName} by: ${AUTHOR}\n" +
+                            "More info at: ${env.BUILD_URL}"
+
+           
+        }
+
+        unstable {
+
+            slackSend channel: '#backend-testing',
+                    color: '#C0392B',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName} by: ${AUTHOR}\n" +
+                            "More info at: ${env.BUILD_URL}"
+        }
+    }
+}
