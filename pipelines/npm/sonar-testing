@@ -1,0 +1,60 @@
+pipeline {
+    agent { label 'test-ven' }
+
+    options {
+        checkoutToSubdirectory 'central-server-ui'
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Install Dependencies') {
+            steps {
+                dir('central-server-ui') {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        stage('Sonarqube Analysis') {
+            steps {
+                withSonarQubeEnv('Sonarqube') {
+                    dir('central-server-ui') {
+                        sh 'npm run sonar'
+                    }
+                }
+            }
+        }
+
+        stage('Sonar Quality Gate') {
+            steps {
+                dir('central-server-ui') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                slackSend channel: '#frontend-testing',
+                    color: '#52BE80',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName}\n" +
+                        "More info at: ${env.BUILD_URL}"
+            }
+        }
+        failure {
+            script {
+                slackSend channel: '#frontend-testing',
+                    color: '#C0392B',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName}\n" +
+                        "Failed on stage: ${env.STAGE_NAME}\n" +
+                        "More info at: ${env.BUILD_URL}"
+            }
+        }
+    }
+}
