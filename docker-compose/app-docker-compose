@@ -1,0 +1,57 @@
+## February 24/2022
+## instance deployment
+version: '3.7'
+services:
+  t6-webservice:
+    image: url
+    ports:
+      - 20001:20001  
+    container_name: WS-BACKEND-WEB8-DEV01
+    restart: unless-stopped
+    volumes:
+      - ./configuration.properties:/opt/t6hs/configuration.properties
+    env_file:
+      - webservice_params.env
+      - stack_params.env
+      - credentials.env
+      - configset.env
+  t6-admin:
+    image: url
+    ports:
+      - 20003:20003 
+    container_name: Admin-BACKEND-WEB8-DEV01
+    restart: unless-stopped
+    volumes:
+      - ./configuration.properties:/opt/t6hs/configuration.properties
+    env_file:
+      - admin_params.env
+      - stack_params.env
+      - credentials.env
+      - configset.env
+
+  t6-central:
+    image: url
+    ports:
+      - "20007:20007"
+    container_name: Central-BACKEND-WEB8-DEV01
+    restart: unless-stopped
+    env_file:
+      - central_params.env
+
+  t6-integration:
+    image: url
+    ports:
+      - "20005:20005"
+      - "20006:20006"
+    container_name: Integration-BACKEND-WEB8-DEV01
+    restart: unless-stopped
+    env_file:
+      - integration_params.env
+      - stack_params.env
+      - credentials.env
+      - configset.env
+
+networks:
+  default:
+    name: t6net
+    external: true
