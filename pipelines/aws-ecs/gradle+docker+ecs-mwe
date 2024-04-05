@@ -1,0 +1,555 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+import java.util.regex.Pattern
+import org.apache.tools.ant.*
+
+//def METADATAVersions = ['n/a']
+def envs = ['n/a'] 
+def choiceArray = []
+def albName = 'T6-DEV-ALB-OTHERS'
+def albArn = ''
+def listenerArn = ''
+def taskDefinitions = [:]  // Declare taskDefinitions here
+def targetGroups = [:]  // Declare targetGroups
+def listenerPort = 443
+def backendVersions = ['n/a']
+
+def handleError(message, exitPipeline = true) {
+    echo "ERROR: ${message}"
+    currentBuild.result = 'FAILURE'
+    if (exitPipeline) {
+        error(message)
+    }
+}
+def METADATA_combine_env
+
+
+def readFileContent(String file) {
+    return readFile(file).trim()
+}
+
+def parseEnvVariables(String envVars) {
+    def envList = []
+    envVars.split('\n').each { line ->
+        if (!line.startsWith("#") && line.contains('=')) {
+            def (key, value) = line.split('=', 2)
+            envList << [name: key.trim(), value: value.trim()]
+        }
+    }
+    return envList // Corrected return statement
+}
+
+// A helper method to fetch image tags from AWS ECR
+def fetchImageTags(String repositoryName) {
+    def command = "aws ecr list-images --region us-east-1 --repository-name ${repositoryName} --output json"
+    def output = sh(script: command, returnStdout: true).trim()
+    def json = new JsonSlurperClassic().parseText(output)
+    def tags = json.imageIds.collect { it.imageTag }.findAll { it != null }
+    return tags.isEmpty() ? ['n/a'] : tags
+}
+
+def getLogConfiguration(String serverName, String containerType) {
+    return [
+        logDriver: "awslogs",
+        options: [
+            "awslogs-group": "T6-Devops-Migration-DEV-LOGS",
+            "awslogs-region": "${AWS_REGION}",
+            "awslogs-stream-prefix": "${serverName}/${containerType}"
+        ]
+    ]
+}
+
+def fetchHighestPriority(String listenerArn) {
+    def command = "aws elbv2 describe-rules --listener-arn ${listenerArn} --region ${AWS_REGION} --query 'Rules[].Priority' --output text"
+    def output = sh(script: command, returnStdout: true).trim()
+    
+    // Filter out 'default' and any non-integer values
+    def priorities = output.split("\\s+").findAll { it.isInteger() }.collect { it as Integer }
+
+    return priorities ? priorities.max() : 0
+}
+
+// Helper method to check if a string is an integer
+String.metaClass.isInteger = {
+    delegate ==~ /\d+/
+}
+
+def updateTaskDefinition(containerConfigs) {
+    TASKFAMILY = "${env.SERVER_NAME}-task"
+
+
+    def containerDefinitions = containerConfigs.collect { config ->
+        def logConfig = JsonOutput.toJson(config.logConfiguration).toString()
+        """
+        {
+            "name": "${env.SERVER_NAME}-${config.containerType}",
+            "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${config.repositoryName}:${config.imageVersion}",
+            "memoryReservation": 256,
+            "essential": true,
+            "portMappings": [{
+                "containerPort": ${config.containerport},
+                "hostPort": ${config.containerport}
+            }],
+            "healthCheck": {
+                "command": ["CMD-SHELL", "exit 0"],
+                "interval": 30,
+                "timeout": 5,
+                "retries": 3,
+                "startPeriod": 60
+            },
+            "environment": ${JsonOutput.toJson(config.taskDefEnv)},
+            "logConfiguration": ${logConfig}
+        }
+        """
+    }.join(',')
+    
+    echo "Container Definitions JSON: ${containerDefinitions}"
+    def taskDefArn = sh(script: """
+        aws ecs register-task-definition \
+            --region ${AWS_REGION} \
+            --family ${TASKFAMILY} \
+            --container-definitions '[${containerDefinitions}]' \
+            --requires-compatibilities FARGATE \
+            --cpu 1024 \
+            --memory 2048 \
+            --task-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole \
+            --execution-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole \
+            --network-mode awsvpc \
+            --output json \
+            --query 'taskDefinition.taskDefinitionArn'
+    """, returnStdout: true).trim()
+    echo "ECS Task Definition ARN: ${taskDefArn}"
+    return taskDefArn
+}
+node('AWS-Connect') {
+    script {
+        // AWS credentials binding
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            // The AWS CLI commands to fetch the image tags
+            backendVersions = fetchImageTags('t6-mwe-backend')
+        }
+        // Set the environment if it's not the default value
+        if ("${params.environment}" != 'n/a') {
+            envs = [params.environment]
+        }
+    }
+}
+
+pipeline {
+    agent {
+        label 'aws'
+    }
+    parameters {
+        choice(name: 'parameterize', choices: ['Yes', 'No'], description: "Run a parameterization dry run?")
+        string(name: 'BRANCH', defaultValue: 'develop', description: 'Enter the name of the Git branch to build')
+        choice(name: 'backendVersions', choices: backendVersions, description: 'Select the mwe-backendVersions to use')
+        string(name: 'VERSION', defaultValue: '', description: 'Enter the version of the frontend to use \n Please make sure the version should be x.x.x or x.x.x-alphabets')
+        choice(name: 'metadataType', choices: ['Lab', 'Editor', 'PostgreSQL'], description: 'Choose metadata type')
+        //choice(name: 'deleteResources', choices: ['No', 'Yes'], description: 'Delete Existing Resources')
+    }
+    environment {
+        AWS_CREDENTIALS_Jenkins = credentials('aws-creds')
+        AWS_REGION = ""
+        AWS_ACCOUNT_ID = ''
+        ECS_CLUSTER_NAME = ''
+        VPC_ID = ''
+        PRIVATE_SUBNET_ID = ''
+        SUBNETS = ""
+        SECURITY_GROUP_ID = ''
+        SECURITY_GROUP_ECS = ''
+        DIRECTORY = 't6-mwe'
+        TASKFAMILY = ''  
+        BACKEND_VERSION = "${params.backendVersions}"
+        VERSION = "${params.VERSION}"
+        CONTAINER_PORT_METADATA_FRONT = 8090
+        CONTAINER_PORT_METADATA_BACK = 8080
+    }
+    stages {
+        stage('Parameterizing Job') {
+            steps {
+                script {
+                    if ("${params.parameterize}" == "Yes") {
+                        currentBuild.result = 'ABORTED'
+                        error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+                    }
+                }
+            }
+        }
+        stage('Set Environment Variables') {
+                steps {
+                    script {
+                        // Set env.SERVER_NAME based on the metadataType selected
+                        if (params.metadataType == 'Editor') {
+                            env.SERVER_NAME = 'editor'
+                        } else if (params.metadataType == 'Lab') {
+                            env.SERVER_NAME = 'lab'
+                        } else if (params.metadataType == 'PostgreSQL') {
+                            env.SERVER_NAME = 'postgresql'
+                        }
+
+                    }
+                }
+            }
+        stage('Checkout Branch') {
+            steps {
+                script {
+                    if (BRANCH != '*/develop') {
+                        println "Checking-out Branch: [${BRANCH}]"
+                        checkout([$class                           : 'GitSCM',
+                                  branches                         : [[name: "${BRANCH}"]],
+                                  doGenerateSubmoduleConfigurations: false,
+                                  extensions                       : [[$class: 'CleanCheckout'], [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]],
+                                  submoduleCfg                     : [],
+                                  userRemoteConfigs                : [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@git.net.venuiti.com:T6/t6-mwe-frontend.git']]
+                        ])
+                    }
+                }
+            }
+        }
+    
+        stage('Generating and Pushing Docker Image') {
+            steps {
+                script {
+                    dir("$DIRECTORY") {
+                        // Azure login
+                        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+                            sh "az acr login --name t6acr"
+                        }
+
+                        // AWS login
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                        // Build Docker image
+                        sh "docker build -t t6-mwe-frontend:${VERSION} --add-host git.net.venuiti.com:10.4.60.1 --build-arg REACT_APP_BACKEND=https://backend.lab.t6.internal/metadata  ."
+
+                        // Tagging and pushing to Azure ACR
+                        sh "docker tag t6-mwe-frontend:${VERSION} t6acr.azurecr.io/t6-mwe-frontend:${VERSION}"
+                        sh "docker push t6acr.azurecr.io/t6-mwe-frontend:${VERSION}"
+
+                        // Tagging and pushing to AWS ECR
+                        sh "docker tag t6-mwe-frontend:${VERSION} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-mwe-frontend:${VERSION}"
+                        sh "docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-mwe-frontend:${VERSION}"
+
+                        // Clean up local tags and image
+                        sh "docker rmi t6acr.azurecr.io/t6-mwe-frontend:${VERSION}"
+                        sh "docker rmi ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-mwe-frontend:${VERSION}"
+                        sh "docker rmi t6-mwe-frontend:${VERSION}" // Removes the original image
+                    }
+                }
+            }
+        }
+
+        stage('Check ECS Cluster') {
+            steps {
+                script {
+                    def clusterStatus = sh(script: """
+                        aws ecs describe-clusters --cluster ${ECS_CLUSTER_NAME} --region ${AWS_REGION} --query 'clusters[0].status' --output text
+                    """, returnStdout: true).trim()
+
+                    echo "Cluster Status: ${clusterStatus}"
+                }
+            }
+        }
+        
+        stage('Check ALB and Create Listener') {
+            steps {
+                script {                    
+                    def albExists = sh(script: """
+                        aws elbv2 describe-load-balancers --names ${albName} --region ${AWS_REGION} --query 'LoadBalancers' --output text
+                    """, returnStatus: true) == 0   
+                    echo "ALB Exists?: ${albExists}"
+                    
+                    albArn = sh(script: """
+                    aws elbv2 describe-load-balancers --names ${albName} --region ${AWS_REGION} --query 'LoadBalancers[0].LoadBalancerArn' --output text
+                """, returnStdout: true).trim()
+                    
+
+                    // Check if the listener exists
+                    def listenerExists = sh(script: """
+                        aws elbv2 describe-listeners --load-balancer-arn ${albArn} --region ${AWS_REGION} --query 'Listeners[0].ListenerArn' --output text
+                    """, returnStdout: true).trim()
+
+                    echo "ListenerArnOutput: ${listenerExists}"
+                    
+                    if (listenerExists) {
+                        // Listener exists, get its ARN
+                        listenerArn = listenerExists
+                        echo "Listener Already Exists. ARN: ${listenerArn}"
+                    } else {
+                        // Create Listener
+                        listenerArn = sh(script: """
+                        aws elbv2 create-listener \
+                            --load-balancer-arn ${albArn} \
+                            --protocol HTTP \
+                            --port ${listenerPort} \
+                            --default-actions Type=fixed-response,FixedResponseConfig={ContentType=text/plain,StatusCode=200,MessageBody=OK} \
+                            --region ${AWS_REGION} \
+                            --output text \
+                            --query 'Listeners[0].ListenerArn'
+                    """, returnStdout: true).trim()
+
+                    echo "Listener Created. ARN: ${listenerArn}"
+                    }
+                }
+            }
+        }
+        stage('Pull Environment Variables from Jenkins Workspace') {
+            steps {
+                script {                  
+                    def workspacePath = env.WORKSPACE
+
+                    // Read the file into a variable
+                    def frontendEnv, backendEnv
+
+                    if (params.metadataType == 'Editor') {
+                        frontendEnv = readFile './CONFIGS/metadata-configs/metadata_editor_frontend.env'              
+                        backendEnv = readFile './CONFIGS/metadata-configs/metadata_editor_backend.env'              
+                    } else if (params.metadataType == 'Lab') {
+                        frontendEnv = readFile './CONFIGS/metadata-configs/metadata_lab_frontend.env'              
+                        backendEnv = readFile './CONFIGS/metadata-configs/metadata_lab_backend.env'              
+                    } else if (params.metadataType == 'PostgreSQL') {
+                        frontendEnv = readFile './CONFIGS/metadata-configs/metadata_PostgreSQL_frontend.env'              
+                        backendEnv = readFile './CONFIGS/metadata-configs/metadata_PostgreSQL_backend.env'              
+                    }
+
+                    // Combine contents of environment variable files
+                    METADATA_combine_frontend_env = frontendEnv + "\n" + readFileContent("/opt/t6/credentials/credentials.env")
+                    METADATA_combine_backend_env =  backendEnv + "\n" + readFileContent("/opt/t6/credentials/credentials.env")
+
+                }
+            }
+        }
+
+        stage('Create ECS Task Definitions and Services') {
+            steps {
+                script {
+                    def containerConfigs = []
+                    containerConfigs = [
+                        [
+                            containerType: "Backend",
+                            repositoryName: "t6-mwe-backend",
+                            imageVersion: "${params.backendVersions}",
+                            taskDefEnv: parseEnvVariables(METADATA_combine_backend_env),
+                            containerport: "${env.CONTAINER_PORT_METADATA_BACK}",
+                            logConfiguration: getLogConfiguration("${env.SERVER_NAME}", "backend")
+
+                        ],
+                        [
+                            containerType: "Frontend",
+                            repositoryName: "t6-mwe-frontend",
+                            imageVersion: "${params.VERSION}",
+                            taskDefEnv: parseEnvVariables(METADATA_combine_frontend_env),
+                            containerport: "${env.CONTAINER_PORT_METADATA_FRONT}",
+                            logConfiguration: getLogConfiguration("${env.SERVER_NAME}", "frontend")
+
+                        ]
+                    ]    
+                    
+                    echo "Container Configs set"
+                    def taskDefArn = updateTaskDefinition(containerConfigs)                   
+                    echo "ECS Task Definition ARN: ${taskDefArn}"
+
+                    // Define a map to store listener port for each container type
+                    def containerPorts = [
+                        "Frontend": "${env.CONTAINER_PORT_METADATA_FRONT}",
+                        "Backend": "${env.CONTAINER_PORT_METADATA_BACK}"
+                    ]
+
+                    // Create Target Group and Listener Rules for Each Container Type
+                    def highestPriority = fetchHighestPriority(listenerArn)
+                    def newPriority = highestPriority + 1
+
+                    def containerTypes = ["Frontend", "Backend"]   
+
+                    for (def containerType in containerTypes) {
+                        def targetGroupName = "${env.SERVER_NAME}-${containerType}-tg"
+                        def containerPort = containerPorts[containerType]                       
+                        // Check if the target group already exists
+                        def targetGroupExists = sh(script: """
+                            aws elbv2 describe-target-groups \
+                                --names ${targetGroupName} \
+                                --region ${AWS_REGION} \
+                                --query 'TargetGroups' \
+                                --output text
+                        """, returnStatus: true) == 0
+
+                        //Create the target group if it doesn't exist
+                        if (!targetGroupExists) {
+                            def targetGroupArn = sh(script: """
+                                aws elbv2 create-target-group \
+                                    --name ${targetGroupName} \
+                                    --protocol HTTP \
+                                    --port ${listenerPort} \
+                                    --target-type ip \
+                                    --vpc-id ${VPC_ID} \
+                                    --region ${AWS_REGION} \
+                                    --matcher HttpCode=200 \
+                                    --health-check-protocol HTTP \
+                                    --health-check-path /${env.SERVER_NAME}/${containerType}/settings \
+                                    --health-check-port ${containerPort} \
+                                    --health-check-interval-seconds 180 \
+                                    --health-check-timeout-seconds 120 \
+                                    --health-check-timeout-seconds 5 \
+                                    --unhealthy-threshold-count 2 \
+                                    --output text \
+                                    --query 'TargetGroups[0].TargetGroupArn'
+                            """, returnStdout: true).trim()
+
+                            echo "Target Group ARN for ${containerType}: ${targetGroupArn}"
+                            targetGroups[containerType] = targetGroupArn
+                        } else {
+                        //Retrieve the existing target group ARN
+                        def existingTargetGroupArn = sh(script: """
+                            aws elbv2 describe-target-groups \
+                                --names ${targetGroupName} \
+                                --region ${AWS_REGION} \
+                                --query 'TargetGroups[0].TargetGroupArn' \
+                                --output text
+                        """, returnStdout: true).trim()
+
+                        echo "Target group already exists for ${containerType}. Using existing Target Group ARN: ${existingTargetGroupArn}"
+                        targetGroups[containerType] = existingTargetGroupArn
+                            
+                        }
+
+                        //Retrieve all rules for the listener
+                        def allRules = sh(script: """
+                            aws elbv2 describe-rules \
+                                --listener-arn ${listenerArn} \
+                                --region ${AWS_REGION} \
+                                --query 'Rules'
+                        """, returnStdout: true).trim()
+
+                        //Check if a rule with the specified conditions already exists
+                        def ruleExists = allRules.contains("/${env.SERVER_NAME}/${containerType}*")
+                        
+                        
+                        //Create the rule if it doesn't exist
+                        if (!ruleExists) {
+                            def targetGroupArn = targetGroups[containerType]
+                            sh """
+                                aws elbv2 create-rule \
+                                    --listener-arn ${listenerArn} \
+                                    --conditions Field=path-pattern,Values=/${env.SERVER_NAME}/${containerType}* \
+                                    --priority ${newPriority} \
+                                    --actions Type=forward,TargetGroupArn=${targetGroupArn} \
+                                    --region ${AWS_REGION}
+                            """
+                            newPriority++ 
+                        } else {
+                            echo "Rule conditions already exist for ${containerType}. Skipping rule creation."
+                            newPriority++ 
+                        }
+                    }
+                    
+                    def ecsServiceName = "${env.SERVER_NAME}-service"
+                    def containerPort_front = "${env.CONTAINER_PORT_METADATA_FRONT}"
+                    def containerPort_back = "${env.CONTAINER_PORT_METADATA_BACK}"
+                    
+                    // Check if the Service Exists, if Not Create Service. If Yes, Delete and Create Service.
+                    def serviceExists = sh(script: """
+                        aws ecs describe-services --cluster ${ECS_CLUSTER_NAME} --services ${ecsServiceName} --region ${AWS_REGION} --query 'services[0].status' --output text
+                    """, returnStdout: true).trim()
+                    
+                    //def updateServiceResult
+                    if (serviceExists != 'ACTIVE') {
+                        echo "Service does not exist. Creating service..."
+                        try {
+                            sh """
+                                aws ecs create-service \
+                                    --region ${AWS_REGION} \
+                                    --cluster ${ECS_CLUSTER_NAME} \
+                                    --service-name ${ecsServiceName} \
+                                    --task-definition ${TASKFAMILY} \
+                                    --desired-count 1 \
+                                    --launch-type FARGATE \
+                                    --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_ID}],securityGroups=[${SECURITY_GROUP_ECS}]}" \
+                                    --enable-execute-command \
+                                    --load-balancers "targetGroupArn=${targetGroups['Frontend']},containerName=${env.SERVER_NAME}-Frontend,containerPort=${CONTAINER_PORT_METADATA_FRONT}" "targetGroupArn=${targetGroups['Backend']},containerName=${env.SERVER_NAME}-Backend,containerPort=${CONTAINER_PORT_METADATA_BACK}"
+                            """
+                        } catch (Exception e) {
+                            handleError("Failed to create service: ${e.message}")
+                        }                
+                    } else {
+                        echo "Service exists. Deleting all tasks and service..."
+                        sh """
+                                aws ecs update-service \
+                                --region ${AWS_REGION} \
+                                --cluster ${ECS_CLUSTER_NAME} \
+                                --service ${ecsServiceName} \
+                                --desired-count 0
+                        """
+                        def taskArns = sh(script: """
+                            aws ecs list-tasks \
+                                --region ${AWS_REGION} \
+                                --cluster ${ECS_CLUSTER_NAME} \
+                                --service-name ${ecsServiceName} \
+                                --query 'taskArns' \
+                                --output text
+                            """, returnStdout: true).trim()
+                        // Stop each task
+                        if (taskArns) {
+                            taskArns.split().each { taskArn ->
+                                // Extract the task ID from the task ARN
+                                def taskId = taskArn.tokenize('/').last()
+
+                                // Stop the task using the task ID
+                                sh """
+                                    aws ecs stop-task \
+                                        --region ${AWS_REGION} \
+                                        --cluster ${ECS_CLUSTER_NAME} \
+                                        --task ${taskId}
+                                """
+                            }
+                            // Wait for all tasks to be stopped
+                            echo "Waiting for tasks to be stopped..."
+                            sh """
+                                aws ecs wait tasks-stopped \
+                                    --region ${AWS_REGION} \
+                                    --cluster ${ECS_CLUSTER_NAME} \
+                                    --tasks ${taskArns}
+                            """
+                        }                      
+                        // Delete the service
+                        echo "Deleting existing ECS service..."
+                        sh """
+                            aws ecs delete-service \
+                                --region ${AWS_REGION} \
+                                --cluster ${ECS_CLUSTER_NAME} \
+                                --service ${ecsServiceName} \
+                                --force
+                        """
+                        // Wait for Service to Drain
+                        
+                        sh """
+                            aws ecs wait services-inactive \
+                                --region ${AWS_REGION} \
+                                --cluster ${ECS_CLUSTER_NAME} \
+                                --services ${ecsServiceName} 
+                        """
+                        echo "Services have stabilized."
+                        try {
+                            sh """
+                                aws ecs create-service \
+                                    --region ${AWS_REGION} \
+                                    --cluster ${ECS_CLUSTER_NAME} \
+                                    --service-name ${ecsServiceName} \
+                                    --task-definition ${TASKFAMILY} \
+                                    --desired-count 1 \
+                                    --launch-type FARGATE \
+                                    --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_ID}],securityGroups=[${SECURITY_GROUP_ECS}]}" \
+                                    --enable-execute-command \
+                                    --load-balancers "targetGroupArn=${targetGroups['Frontend']},containerName=${env.SERVER_NAME}-Frontend,containerPort=${CONTAINER_PORT_METADATA_FRONT}" "targetGroupArn=${targetGroups['Backend']},containerName=${env.SERVER_NAME}-Backend,containerPort=${CONTAINER_PORT_METADATA_BACK}"
+                            """
+                        } catch (Exception e) {
+                            handleError("Failed to create service: ${e.message}")
+                        }
+                        
+                    }       
+                }
+            }
+        }    
+    }
+}
+
