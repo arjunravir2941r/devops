@@ -1,0 +1,436 @@
+def electronBuildCommand = ""
+
+pipeline {
+    agent { label 'web-ui' }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(
+            defaultValue: 'installer/njua2svzb',
+            description: 'Enter the public URL prefix. It will be a part of URL for the build',
+            name: 'public_url_prefix'
+        )
+        string(
+            defaultValue: 'release/1.1.8',
+            description: 'Enter the name of the Git WEB_UI_BRANCH to build',
+            name: 'WEB_UI_BRANCH'
+        )
+        choice(name: 'NEXUS_ONLY', choices: ['true', 'false'], description: 'Only select true for E2E Test, else keep it as false')
+        choice(name: 'MODE', choices: ['production', 'test', 'development'], description: 'Build mode')
+        
+    }
+
+    environment {
+        DIRECTORY = 'Web-ui-Electron-Release'
+        COMMIT_HASH = ''
+        URL_STATUS = 'NOT_FOUND' // Default value
+        CODE_SIGNING_CERT_PATH = "c:\\tools\\jenkins-agent\\t6-code-signing-cert.cer"
+    }
+
+    stages {
+        stage('Display BRANCH SELECTED') {
+            steps {
+                script {
+
+                    env.WEB_UI_BRANCH = params.WEB_UI_BRANCH
+                    echo "Selected WEB_UI_BRANCH: ${env.WEB_UI_BRANCH}"
+                    
+
+                }
+            }
+        }
+        stage('Construct Nexus URL') {
+            
+            when {
+                expression { params.NEXUS_ONLY == 'true' }
+            }
+            steps {
+                script {
+                    // Initialize and set variables
+                    def version = (params.WEB_UI_BRANCH ==~ /release\/\d+\.\d+\.\d+/) ? params.WEB_UI_BRANCH.tokenize('/')[1] : 'dev'
+                    def COMMIT_HASH = ''
+
+                    sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                        COMMIT_HASH = sh(
+                            script: "git ls-remote git@git.net.venuiti.com:T6/web-ui.git ${params.WEB_UI_BRANCH} | cut -f1",
+                            returnStdout: true
+                        ).trim()[0..6]
+                    }
+
+                    // Construct Nexus URL
+                    def nexusUrl = "https://nexus.t6cloud.com/repository/t6hs-releases/com/t6hs/t6-web-app/${params.WEB_UI_BRANCH}/TAC_Client_Setup_${version}_${COMMIT_HASH}.exe"
+                    println "Nexus URL: ${nexusUrl}"
+
+                    // Check URL status and set the global variable
+                    try {
+                        def url = new URL(nexusUrl)
+                        def connection = url.openConnection()
+                        connection.requestMethod = 'GET'
+                        connection.connect()
+                        def responseCode = connection.responseCode
+                        if (responseCode == 200) {
+                            println "URL Status: OK"
+                            URL_STATUS = 'OK'
+                            env.NEXUS_URL_STRING = "https://nexus.t6cloud.com/repository/t6hs-releases/com/t6hs/t6-web-app/${params.WEB_UI_BRANCH}/TAC_Client_Setup_${version}_${COMMIT_HASH}.exe"
+                            println "NEXUS_URL_STRING: ${env.NEXUS_URL_STRING}"
+                        } else {
+                            println "URL Status: Not Found"
+                        }
+                    } catch (Exception e) {
+                        println "Error checking URL: ${e.message}"
+                    }
+                }
+            }
+        }
+        stage('Start Arm64 VM') {
+            when {
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            steps {
+                withCredentials([azureServicePrincipal('t6-acr-service-principal2')]) {
+                    script {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+                        sh "az vm start --resource-group Development_DevOps --name electron-arm64"
+                    }
+                }
+            }
+        }
+
+        
+
+        stage('Configure Git attributes') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+
+                bat 'git config --global user.email "jenkins@t6hs.com"'
+                bat 'git config --global user.name "Jenkins"'
+                bat 'python --version'
+                
+            }
+        }
+
+        stage('Checkout WEB_UI_BRANCH') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                script {
+                    if (WEB_UI_BRANCH != '*/develop') {
+                        println "Checking-out WEB_UI_BRANCH: [${WEB_UI_BRANCH}]"
+						timeout(time: 20, unit: 'MINUTES') {
+							checkout([
+								$class: 'GitSCM',
+								branches: [[name: "${WEB_UI_BRANCH}"]],
+								doGenerateSubmoduleConfigurations: false,
+								extensions: [
+									[$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]
+								],
+								submoduleCfg: [],
+								userRemoteConfigs: [
+									[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@git.net.venuiti.com:T6/web-ui.git']
+								]
+							])
+						}
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Commit Hash') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        // Execute the Git command and save output to commit_hash.txt
+                        bat(returnStdout: true, script: 'git rev-parse --short HEAD > commit_hash.txt')
+                        // Read the commit hash and ensure it's 7 characters long
+                        def commitHash = readFile('commit_hash.txt').trim()
+                        COMMIT_HASH = commitHash.length() > 7 ? commitHash.substring(0, 7) : commitHash
+                        // Print the commit hash
+                        echo "Commit Hash: ${COMMIT_HASH}"
+                    }
+                }
+            }
+        }
+
+
+        stage('Clean up') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}") {
+                    bat 'make clean'
+                }
+            }
+        }
+
+        stage('Deps install') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}") {
+                    bat 'make install'
+                }
+            }
+        }
+        stage('Remove node_modules symlinks') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}") {
+                    bat 'if exist electron\\node_modules\\t6-web rmdir /s /q electron\\node_modules\\t6-web'
+                    bat 'if exist electron\\node_modules\\t6-app rmdir /s /q electron\\node_modules\\t6-app'
+                    bat 'if exist frontend\\node_modules\\t6-web rmdir /s /q frontend\\node_modules\\t6-web'
+                    bat 'if exist frontend\\node_modules\\t6-app rmdir /s /q frontend\\node_modules\\t6-app'
+                }
+            }
+        }
+
+        stage('App build') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                
+                script {                   
+                    if (MODE == 'test') {
+                        electronBuildCommand = "build:windows:test:x64"
+                    } else if (MODE == 'development') {
+                        electronBuildCommand = "build:windows:dev"
+                    } else {
+                        electronBuildCommand = "build:windows:prod"
+                    }
+                }
+                
+                dir("${DIRECTORY}") {
+                     withCredentials([string(credentialsId: 'T6_CodeSigning_Token_Password', variable: 'T6_CodeSigning_Token_Password'),
+                                      string(credentialsId: 'T6_CodeSigning_Token_Name', variable: 'T6_CodeSigning_Token_Name')]) {
+                        bat """
+                            set "REACT_APP_BUILD_NUMBER=%BUILD_NUMBER%" && set "REACT_APP_SANITIZE_SENSITIVE_FIELDS=true" && yarn run --cwd ./frontend build:for:electron
+                        """
+                        
+                        bat """
+                            set "CERT_PATH=${env.CODE_SIGNING_CERT_PATH}" && set "CERT_PASS=${T6_CodeSigning_Token_Password}" && set "CODE_SIGNING_CERT_TOKEN_NAME=${T6_CodeSigning_Token_Name}" && yarn run --cwd ./electron ${electronBuildCommand}
+                        """                        
+                     }
+                }
+            }
+        }
+        
+
+        stage('Upload to Azure Storage') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}\\electron") {
+                    withCredentials([string(credentialsId: 'sasToken-ELectron', variable: 'sasToken-ELectron')]) {
+                        echo "Using Commit Hash: ${COMMIT_HASH}"
+                        bat """
+                        for %%G in (.\\applications\\*.exe) do (
+                            echo Uploading: %%~nG.${env.BUILD_NUMBER}.exe
+                            az storage blob upload --account-name t6hsfilesinstallers --container-name artifacts --name "T6_WebUi/T6_WebUi_ElectronRelease/${COMMIT_HASH}/%%~nG.${env.BUILD_NUMBER}.exe" --type block --sas-token "%sasToken-ELectron%" --file "%%G" --overwrite
+                            echo %%~nG.${env.BUILD_NUMBER}.exe
+                            echo %%~nG.${env.BUILD_NUMBER}.exe > tmp.txt
+                        )
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Upload to Nexus') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                script {
+                    // Determine the build version
+                    def buildversion = (params.WEB_UI_BRANCH ==~ /release\/\d+\.\d+\.\d+/) ? params.WEB_UI_BRANCH.tokenize('/')[1] : 'dev'
+
+                    // Proceed to upload
+                    dir("${DIRECTORY}\\electron") {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'Nexus',
+                            usernameVariable: 'nexusUsername',
+                            passwordVariable: 'nexusPassword'
+                        )]) {
+                            bat """
+                            for %%G in (.\\applications\\*.exe) do (
+                                echo Uploading: TAC_Client_Setup_${buildversion}_${COMMIT_HASH}.exe
+                                curl -v -u ${nexusUsername}:${nexusPassword} --upload-file "%%G" "https://nexus.t6cloud.com/repository/t6hs-releases/com/t6hs/t6-web-app/${params.WEB_UI_BRANCH}/TAC_Client_Setup_${buildversion}_${COMMIT_HASH}.exe"
+                                echo TAC_Client_Setup_${buildversion}_${COMMIT_HASH}.exe uploaded
+                            )
+                            """
+
+                            // Define the Nexus URL string
+                            def nexus_urlString = "https://nexus.t6cloud.com/repository/t6hs-releases/com/t6hs/t6-web-app/${params.WEB_UI_BRANCH}/TAC_Client_Setup_${buildversion}_${COMMIT_HASH}.exe"
+
+                            // Store the URL in a custom environment variable
+                            env.NEXUS_URL_STRING = nexus_urlString
+                            echo "Nexus URL: ${nexus_urlString}"
+                        }
+                    }
+                }
+            }
+        }
+        
+
+        stage('Push Git Tag') {
+            when {
+                beforeAgent true
+                allOf {
+                    expression { URL_STATUS == 'NOT_FOUND' }
+                    expression { MODE == 'production' }
+                }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}\\electron") {
+                    script {
+
+                        echo "MODE: ${params.MODE}"
+                        echo "URL_STATUS: ${env.URL_STATUS}"
+                        // Verify if the file exists
+                        def filePath = '.\\tmp.txt'
+                        if (!fileExists(filePath)) {
+                            error("File not found: ${filePath}")
+                        }
+
+                        // Read the content of the file
+                        def fileContent = readFile(filePath).trim()
+
+                        // Subtract the version number by removing the last space and the ".exe" extension
+                        def lastSpaceIndex = fileContent.lastIndexOf(' ')
+                        def tagContent = fileContent.substring(lastSpaceIndex + 1, fileContent.lastIndexOf('.exe'))
+
+                        echo "${tagContent}"
+
+                        // Push the extracted content as a Git tag
+                        try {
+                            sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                                bat """
+                                    git config --global user.email "jenkins@t6hs.com"
+                                    git config --global user.name "Jenkins"
+                                    git tag "${tagContent}"
+                                    git push origin --tags --no-verify 
+                                """
+                            }
+                        } catch (Exception e) {
+                            error("Error occurred while executing Git commands: ${e.getMessage()}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Clean up after builds') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}") {
+                    bat 'if exist frontend\\node_modules\\t6-web rmdir /s /q frontend\\node_modules\\t6-web'
+                    bat 'if exist docs\\node_modules\\t6-web rmdir /s /q docs\\node_modules\\t6-web'
+                    bat 'if exist electron\\node_modules\\t6-web rmdir /s /q electron\\node_modules\\t6-web'
+                }
+            }
+        }
+
+        stage('Store Azure URL') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            steps {
+                dir("${DIRECTORY}\\electron") {
+                    script {
+                        def fileName = readFile('tmp.txt').trim()
+                        def publicUrlPrefix = env.PUBLIC_URL_PREFIX
+                        def web_urlString = "https://t6hs.com/${publicUrlPrefix}/${COMMIT_HASH}/${fileName}"
+                        // Store the URL in a custom environment variable
+                        env.WEB_URL_STRING = web_urlString
+                        echo "URL: ${web_urlString}"
+                    }
+                }
+            }
+        }
+
+        stage('Deallocate Arm64 VM') {
+            when {
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            steps {
+                sh 'echo deallocating...'
+/*                
+                withCredentials([azureServicePrincipal('t6-acr-service-principal2')]) {
+                    script {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+                        sh "az vm deallocate --resource-group Development_DevOps --name electron-arm64"
+                    }
+                }
+*/                
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                if (URL_STATUS == 'NOT_FOUND') {
+                    // Send message indicating a successful build with the public app download URL
+                    slackSend channel: '#frontend-builds',
+                        color: '#73c990',
+                        message: "SUCCESS: <${env.BUILD_URL}|${currentBuild.fullDisplayName}> ${MODE} build from ${env.WEB_UI_BRANCH}WEB_UI_BRANCH completed.\n" +
+                                "PUBLIC app download URL: <${env.WEB_URL_STRING}|${env.WEB_URL_STRING}>"
+                } else if (URL_STATUS == 'OK') {
+                    // Send message for E2E test success indicating that EXE is already published
+                    slackSend channel: '#frontend-builds',
+                        color: '#73c990',
+                        message: "SUCCESS: <${env.BUILD_URL}|${currentBuild.fullDisplayName}> ${MODE} build from ${env.WEB_UI_BRANCH} WEB_UI_BRANCH completed.\n" +
+                                "PUBLIC app download URL: EXE already published in azure repo "
+                }
+            }
+    }
+        failure {
+            slackSend channel: '#frontend-builds',
+                color: '#d54c53',
+                message: "FAILURE: <${env.BUILD_URL}|${currentBuild.fullDisplayName}> ${MODE} build from ${env.WEB_UI_BRANCH} WEB_UI_BRANCH failed.\n"
+        }
+    }
+}
+
+
