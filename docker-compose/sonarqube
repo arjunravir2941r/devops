@@ -1,0 +1,38 @@
+version: "3"
+services:
+   sonarqube_dev:
+      image: sonarqube:lts-developer
+      container_name: Sonarqube-AWS-DEVOPS
+      restart: unless-stopped
+      depends_on:
+         - db
+      environment:
+         SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonar
+      env_file:
+         - sonarqube.env
+      volumes:
+         - ./sonarqube_dev_data:/opt/sonarqube/data
+         - ./sonarqube_dev_extensions:/opt/sonarqube/extensions
+         - ./sonarqube_dev_logs:/opt/sonarqube/logs
+      ports:
+        - "9000:9000"
+      networks:
+         - Sonar-Network
+
+   db:
+      image: postgres:12
+      container_name: SonarqubeDB-AWS-DEVOPS
+      restart: unless-stopped
+      env_file:
+         - db.env
+      ports:
+         - "5433:5432"
+      volumes:
+         - ./postgresql:/var/lib/postgresql
+         - ./postgresql_data:/var/lib/postgresql/data
+      networks:
+         - Sonar-Network
+networks:
+  Sonar-Network:
+    external: true
+    name: Devops-Tool
