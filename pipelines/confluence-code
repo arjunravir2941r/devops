@@ -1,0 +1,120 @@
+post {
+        success {
+            script {
+                slackSend channel: '#backend-releases',
+                    color: '#73c990',
+                    message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed and the  ${server} is updated the with the below parameters:\n" +
+                            "WS_VERSION = ${WS_VERSION}\n" +
+                            "ADMIN_VERSION = ${ADMIN_VERSION}\n" +
+                            "CENTRAL_VERSION = ${CENTRAL_VERSION}\n" +
+                            "INTEGRATION_VERSION = ${INTEGRATION_VERSION}\n" +
+                            "configset = ${configset}\n" 
+                withCredentials([usernamePassword(credentialsId: 'confluenceCredentials', passwordVariable: 'CONFLUENCE_TOKEN', usernameVariable: 'CONFLUENCE_USERNAME')]) {
+
+                    def authString = "${CONFLUENCE_USERNAME}:${CONFLUENCE_TOKEN}".bytes.encodeBase64().toString()
+                    def baseURL = 'https://t6health.atlassian.net/wiki/rest/api/content'
+
+                    // Search for an existing child page
+                    def pageSearchURL = baseURL + '?spaceKey=TDS&title=' + URLEncoder.encode(params.selectserver, "UTF-8")
+                    def pageSearchResponse = httpRequest(
+                        httpMode: 'GET',
+                        url: pageSearchURL,
+                        contentType: 'APPLICATION_JSON',
+                        customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]]
+                    )
+                    def jsonResponse = readJSON text: pageSearchResponse.content
+                    def existingPageId = (jsonResponse && jsonResponse.results && !jsonResponse.results.isEmpty()) ? jsonResponse.results[0].id : null
+
+                    // Delete the existing page if it exists
+                    if (existingPageId) {
+                        def deleteURL = baseURL + '/' + existingPageId
+                        httpRequest(
+                            httpMode: 'DELETE',
+                            url: deleteURL,
+                            contentType: 'APPLICATION_JSON',
+                            customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]]
+                        )
+                    }
+
+                    // Create a new child page
+                    def buildTimestamp = new Date(currentBuild.startTimeInMillis)
+                    def buildTime = buildTimestamp.format('yyyy-MM-dd HH:mm', TimeZone.getTimeZone('America/Toronto'))
+
+                    def parentPageId = '15368193'
+                    def newPageContent = """*
+                            <table>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Value</th>
+                                </tr>
+                                <tr>
+                                    <td>WEBSERVICE_VERSION</td>
+                                    <td>${params.wsVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>ADMIN_VERSION</td>
+                                    <td>${params.adminVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>CENTRAL_VERSION</td>
+                                    <td>${params.centralVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>INTEGRATION_VERSION</td>
+                                    <td>${params.integrationVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>configset</td>
+                                    <td>${params.configSet}</td>
+                                </tr>
+                                <tr>
+                                    <td>Jenkins URL</td>
+                                    <td><a href="${env.BUILD_URL}">Jenkins</a></td>
+                                </tr>
+                                <tr>
+                                    <td>buildTime</td>
+                                    <td>${buildTime}</td>
+                                </tr>
+                                <tr>
+                                    <td>Description</td>
+                                    <td>${params.userComments}</td>
+                                </tr>
+                                <tr>
+                                    <td>Admin URL</td>
+                                    <td>https://dev.t6cloud.com/${server}/admin/</td>
+                                </tr>
+                                <tr>
+                                    <td>Webservice URL</td>
+                                    <td>https://url/${server}/ws/settings/</td>
+                                </tr>
+                            </table>
+                        """
+
+
+                    def newPagePayload = [
+                        type: 'page',
+                        title: params.selectserver,
+                        space: [key: 'TDS'],
+                        ancestors: [ [id: parentPageId] ],
+                        body: [ storage: [value: newPageContent, representation: 'storage'] ]
+                    ]
+
+                    httpRequest(
+                        httpMode: 'POST',
+                        url: baseURL,
+                        contentType: 'APPLICATION_JSON',
+                        customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]],
+                        requestBody: writeJSON(returnText: true, json: newPagePayload)
+                    )
+                }
+            }            
+        }
+
+        failure {
+            slackSend channel: '#backend-releases',
+                color: '#d54c53',
+                message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+        }
+    }
