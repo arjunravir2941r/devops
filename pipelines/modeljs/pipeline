@@ -1,0 +1,144 @@
+#!groovy
+
+@Library(['getChanges']) _
+
+pipeline {
+
+    agent { label 'web-ui' }
+
+    environment {
+        DIRECTORY = 't6-model-js'
+        AUTHOR = ''
+        
+    }
+     parameters {
+        
+        string(name: 'BRANCH', defaultValue: 'master', description: 'Enter the name of the Git branch to build')
+        choice(name: 'CLIENT', choices: ['JOMIS', 'STRSMETA', 'REGISTRY', 'DEV-STRSMETA', 'QA-STRSMETA', 'DEV-ModelJS'], description: 'Provide the client name')
+
+    }
+
+
+    options {
+        checkoutToSubdirectory('t6-model-js')
+        ansiColor('xterm')
+        timestamps()
+        
+    }
+    
+
+
+    stages {
+        
+        stage('Start Build Notification') {
+            steps {
+                slackSend channel: '#frontend-release',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+        
+        stage('Delete "dist" Folder') {
+            steps {
+                script {
+                    // Check if the 'dist' folder exists
+                    def distFolderExists = sh(script: "[ -d ${DIRECTORY}/dist ]", returnStatus: true)
+            
+                    if (distFolderExists == 0) {
+                        echo "Deleting 'dist' folder..."
+                        sh "rm -rf ${DIRECTORY}/dist"
+                    } else {
+                        echo "No 'dist' folder found in the working directory."
+                    }
+                }
+            }
+        }
+        
+        stage('Checkout Branch') {
+            steps {
+                script {
+                    echo "Checking-out Branch: [${params.BRANCH}]"
+                    checkout([$class: 'GitSCM',
+                        branches: [[name: "*/${params.BRANCH.trim()}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanCheckout'], 
+                            [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[
+                            credentialsId: 'Jenkins-Gitlab-Service-Account', 
+                            url: 'giturl/model-js.git'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+
+        stage('NPM Install') {
+            steps {
+                dir("${DIRECTORY}") {
+               
+                    sh "npm install"
+                }
+            }
+        }
+        
+        stage('NPM Build') {
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        
+                        sh "CLIENT=${params.CLIENT} npm run build"
+                    }
+                }
+            }
+        }
+
+        
+        stage('Get Version from package.json') {
+            steps {
+                script {
+                    // Read the version from package.json
+                    def packageJson = readJSON file: "${DIRECTORY}/package.json"
+                    env.VERSION = packageJson.version
+                    echo "Version: ${env.VERSION}"
+                }
+            }
+        }
+        
+        stage('Upload to Nexus') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'Nexus',
+                        usernameVariable: 'nexusUsername',
+                        passwordVariable: 'nexusPassword'
+                    )]) {
+                        // Adjust the path to the zip file if necessary
+                        sh """
+                        curl -v -u $nexusUsername:$nexusPassword --upload-file ${DIRECTORY}/dist/model.js \
+                        "https://nexusurlm/repository/t6hs-releases/com/t6hs/t6-model-js/${params.CLIENT}/${env.VERSION}/model.js"
+                        """
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            slackSend channel: '#frontend-release',
+                    color: '#73c990',
+                    message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed" 
+                            
+        }
+        failure {
+
+            slackSend channel: '#frontend-release',
+                    color: '#d54c53',
+                    message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+        }
+    }
+}
