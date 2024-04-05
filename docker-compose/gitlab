@@ -1,0 +1,31 @@
+version: '3.6'
+services:
+  web:
+    image: 'gitlab/gitlab-ce:latest'
+    restart: always
+    hostname: 'gitlab.t6.local'
+    container_name: Gitlab-Server
+    env_file:
+      - gitlab.env
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://gitlab.t6.local'
+        nginx['ssl_certificate'] = "/etc/ssl/wildcard.t6.local.crt"
+        nginx['ssl_certificate_key'] = "/etc/ssl/wildcard.t6.local.key"
+        nginx['redirect_http_to_https'] = true
+    ports:
+      - '443:443'
+      - '22:22'
+    volumes:
+      - './gitlab-config:/etc/gitlab'
+      - './gitlab-logs:/var/log/gitlab'
+      - './gitlab-data:/var/opt/gitlab'
+      - './ssl:/etc/ssl'
+    networks:
+      - gitlab-network
+
+
+networks:
+  gitlab-network:
+    external: true
+    name: Devops-Tool
