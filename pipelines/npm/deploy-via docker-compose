@@ -1,0 +1,133 @@
+#!groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def frontendVersions = ['n/a']
+
+def envs = ['n/a']
+
+@Library(['sortVersions', 'getNexusArtifactVersions']) _
+
+node( 'Agent-web-ui' ) {
+script {
+
+    withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+        sh script: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+
+        def frontendTags = sh script: 'az acr repository show-tags -n t6Acr --orderby time_desc --repository t6-web-ui-frontend', returnStdout: true
+        frontendVersions = new JsonSlurperClassic().parseText(frontendTags)
+    }
+
+    if ("${params.environment}" != 'n/a') {
+        envs = [params.environment]
+        }
+}
+}
+
+pipeline {
+    agent { label 'web-ui' }
+
+    parameters {
+        
+        choice name: 'parameterize',
+            choices: ['Yes', 'No'],
+            description: "Do you wish to do a dry run to grab/update parameters?\n" +
+                    " - It is recommended to run with in this mode before deploy"
+
+        choice name: 'frontendVersion',
+                choices: frontendVersions,
+                description: 'Select the web-ui-frontend-version to use'
+
+        choice name: 'selectserver',
+                choices: ['dev1', 'dev2','dev3', 'dev4','dev5', 'qa1', 'qa2', 'qa3', 'qa4', 'qa5'],
+                description: 'Server to make changes'
+
+    }
+
+    environment {
+
+        FRONTEND_VERSION = "${params.frontendVersion}"
+        server = "${params.selectserver}"
+        DIRECTORY = 't6-web-ui-frontend'
+
+    }
+
+    options {
+        checkoutToSubdirectory('t6-web-ui-frontend')
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage("Parameterizing Job") {        
+            steps {
+                script {
+                    if ("${params.parameterize}" == "Yes") {
+                            currentBuild.result = 'ABORTED'
+                            error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+                    }
+                }
+            }
+        }
+
+        stage('Start Start Build Notification') {
+            steps {
+                slackSend channel: '#frontend-release',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+
+
+        stage('Creating docker-compose file') {
+            steps {
+                script {
+                    dir("/home/t6admin/servers/${server}") {
+
+                        // Read the Docker Compose file
+                        def composeFile = readFile("docker-compose.yml")
+
+                        // Replace the version of t6-webservice
+                        composeFile = composeFile.replaceAll("image:.*", "image:$FRONTEND_VERSION")
+
+                         // Write the updated Docker Compose file
+                        writeFile file: "docker-compose.yml", text: composeFile
+
+                    }
+                }
+            }
+        }
+        stage('Creating dockers') {
+            steps {
+                script {
+                    dir("/home/t6admin/servers/${server}") {
+                        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+                            sh "az acr login -n t6acr"
+                            sh script: "docker-compose up --build -d --remove-orphans"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend channel: '#frontend-release',
+                        color: '#73c990',
+                        message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed and the  ${server} is updated the with the below parameter:\n" +
+                            " web_ui_frontend_version = ${FRONTEND_VERSION}\n" 
+                            
+        }
+
+        failure {
+            slackSend channel: '#frontend-release',
+                color: '#d54c53',
+                message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+        }
+    }
+}
