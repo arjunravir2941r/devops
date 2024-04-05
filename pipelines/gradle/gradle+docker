@@ -1,0 +1,160 @@
+#!groovy
+
+pipeline {
+
+    agent { label 'aws' }
+
+    parameters {
+        string(
+                defaultValue: '*/develop',
+                description: 'Branch (examples:  */my_branch, */feature/DEV-XXXX, etc...)',
+                name: 'BRANCH')
+        
+        string(
+        defaultValue: 'null',
+        description: 'Version number (example: 1.2.3)',
+        name: 'VERSION'
+    )
+    }
+
+    environment {
+        DIRECTORY = 't6-admin'
+        COMMIT_MESSAGES = ''
+        LATEST_TAG = ''
+        NEXUS_URL = 'https://nexus.t6cloud.com'
+        AI_VERSION = '3.4.15'
+        DOD_CERTIFICATES_VERSION = '1.0.0'
+        AWS_REGION = "us-east-1" 
+        AWS_CREDENTIALS_Jenkins=credentials('aws-creds')
+        AWS_ACCOUNT_ID = '404678654041'
+    }
+
+    options {
+        checkoutToSubdirectory "t6-admin"
+        ansiColor('xterm')
+    }
+    tools {
+        jdk 'java17'
+    }
+
+
+    stages {
+
+        stage('Start Build Notification') {
+            steps {
+                slackSend channel: '#backend-releases',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+
+        stage('Checkout Branch') {
+            steps {
+                script {
+                    if (BRANCH != '*/develop') {
+                        println "Checking-out Branch: [${BRANCH}]"
+                        checkout([$class                           : 'GitSCM',
+                                  branches                         : [[name: "${BRANCH}"]],
+                                  doGenerateSubmoduleConfigurations: false,
+                                  extensions                       : [[$class: 'CleanCheckout'], [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]],
+                                  submoduleCfg                     : [],
+                                  userRemoteConfigs                : [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@dev-gitlab.t6cloud.com:backend/t6-admin.git']]
+                        ])
+                    }
+                }
+            }
+        }
+
+        stage('Update Version') {
+            steps {
+                sh "ls -l $DIRECTORY/gradle.properties"
+                sh "awk '{if(NR==1) print \"version=${VERSION}\"; else print \$0}' ${DIRECTORY}/gradle.properties > ${DIRECTORY}/gradle.properties.tmp && mv ${DIRECTORY}/gradle.properties.tmp ${DIRECTORY}/gradle.properties"
+
+                println "Updated version to ${VERSION} in gradle.properties"
+    }
+}
+
+
+
+
+        stage('Gradle Application Build') {
+            steps {
+                dir("$DIRECTORY") {
+                    script {
+                        sh 'chmod 777 gradlew'
+                        LATEST_TAG = sh script: './gradlew -q getVersion', returnStdout: true
+                        LATEST_TAG = LATEST_TAG.trim()
+                        sh './gradlew assemble -x test'
+                        sh './gradlew publish'
+                        
+
+                    }
+                }
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                script {
+                    dir("$DIRECTORY/build/libs") {
+                        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+
+                            println("Building image for version[${LATEST_TAG}].")
+                            sh script: 'rm -rf acr_build'
+                            sh script: 'mkdir acr_build'
+                            sh script: "curl -sS -L ${NEXUS_URL}/repository/maven-releases/com/microsoft/azure/applicationinsights-agent/${AI_VERSION}/applicationinsights-agent-${AI_VERSION}.jar -o acr_build/applicationinsights-agent-${AI_VERSION}.jar -k"
+                            sh script: "curl -sS -L ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-mtls/dod-certificates/${DOD_CERTIFICATES_VERSION}/dod-certificates-${DOD_CERTIFICATES_VERSION}.zip -o acr_build/dod-certificates-${DOD_CERTIFICATES_VERSION}.zip -k"
+                            sh script: "unzip -d acr_build/ acr_build/dod-certificates-${DOD_CERTIFICATES_VERSION}.zip"
+                            sh script: 'cp -R ../../scripts acr_build/.'
+                            sh script: 'cp ../../Dockerfile acr_build/.'
+                            sh script: 'cp ../../cacerts acr_build/.'
+                            sh script: 'cp -r ../../scripts acr_build/.'
+                            sh script: "cp t6-admin-${LATEST_TAG}.war acr_build/app.war"
+
+                            dir('acr_build') {
+                                sh "az acr build . --registry t6Acr --image t6-admin:${VERSION.toLowerCase()}"
+                                sh "az acr login --name t6acr"
+                                sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                                sh "docker build -t ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-admin:${VERSION.toLowerCase()} ."
+                                sh "docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-admin:${VERSION.toLowerCase()}"
+
+                                 // Deleting the Docker image from Jenkins agent
+                                sh "docker rmi ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-admin:${VERSION.toLowerCase()}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    post {
+        success {
+            slackSend channel: '#backend-releases',
+                    color: '#73c990',
+                    message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed and a new Docker Image was generated: \n" +
+                            "From Branch: [$BRANCH]\n" +
+                            "With version: [${LATEST_TAG}]\n" +
+                            "To get this Docker Image: [ docker pull t6acr.azurecr.io/t6-admin:${VERSION.toLowerCase()} ]\n" +
+                            "AWS :docker pull ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/t6-admin:${VERSION.toLowerCase()} \n" 
+                            
+        }
+        failure {
+
+            slackSend channel: '#backend-releases',
+                    color: '#d54c53',
+                    message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+
+            
+        }
+    }
+}
+
+
+
+
