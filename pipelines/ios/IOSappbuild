@@ -1,0 +1,155 @@
+
+pipeline {
+    agent {
+        label 'ios16'
+    }
+    
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '-1', artifactNumToKeepStr: '-1'))
+    }
+
+    environment {
+        GIT_URL = 'git@10.4.10.122:T6/ipad.git'
+        AZURE_URL = '.blob.core.windows.net/iosapps'
+        NEXUS_URL = 'https://nexusurl/repository/iosapps-commercial/com/t6hs/t6fortrauma/public'
+        USER_CREDENTIALS = credentials('Mac-mini')
+        NEXUS_CREDENTIALS = credentials('Nexus')
+        APPSTORE_CONNECT_API_KEY = credentials('app_store_connect_api_key')
+        LC_ALL = 'en_US.UTF-8'
+        LANG    = 'en_US.UTF-8'
+        MATCH_PASSWORD = '*****'
+        ITMSTRANSPORTER_FORCE_ITMS_PACKAGE_UPLOAD = 'false'
+    }
+    
+    parameters {
+
+        string(
+            defaultValue: '3.2.8', 
+            name: 'APP_VERSION', 
+            trim: true,
+            description: "Application version"
+        )
+        booleanParam(
+            defaultValue: false, 
+            description: 'Upload to TestFlight', 
+            name: 'UPLOAD_TO_TESTFLIGHT'
+        )
+        string(
+            defaultValue: 'develop', 
+            name: 'BRANCH', 
+            trim: true,
+            description: 'Git branch'
+        )
+        booleanParam(
+            defaultValue: true, 
+            description: 'Create simulator build', 
+            name: 'SIMULATOR_BUILD'
+        )
+    }
+    
+    
+    stages {
+        stage('Checkout Sources') {
+            steps {
+                script {
+                    git branch: "${params.BRANCH}", credentialsId: 'Jenkins-Gitlab-Service-Account', url: env.GIT_URL
+                }
+            }
+        }
+        stage('Update Bundle') {
+            steps {
+                script {
+                    dir('src') {
+                        sh "bundle update && bundle install"
+                    }
+                }
+            }
+        }
+        stage('Set App name') {
+            steps {
+                script {
+                    dir('src/T6') {
+                        sh "plutil -replace CFBundleDisplayName -string 'T6 for Trauma' './T6/Info.plist'"
+                    }
+                }
+            }
+        }
+        stage('Set versions') {
+            steps {
+                script {
+                    dir('src/T6') {
+                        ['./T6/Info.plist'].each { app ->
+                            sh "plutil -replace CFBundleShortVersionString -string ${params.APP_VERSION} ${app}"
+                        }
+                    }
+                    dir('src') {
+                        sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                            sh "bundle exec fastlane T6_Set_Build_Number build_number:$BUILD_NUMBER"
+                        }
+                    }
+                    dir('src/T6') {
+                        CURRENT_VERSION = sh script: "agvtool mvers -terse1 | tr -d '\n'", returnStdout: true
+                       
+                    }
+                }
+            }
+        }
+        stage('Update Dependencies') {
+            steps {
+                dir('src') {
+                    sh 'bundle install'
+                    sh 'pod repo update --silent'
+                    sh 'pod install'
+                }
+            }
+        }
+        stage('T6 AppStore IPA') {
+            when {
+                expression { return params.UPLOAD_TO_TESTFLIGHT == true }
+            }
+            steps {
+                dir('src') {
+                    sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                        sh "echo ${APPSTORE_CONNECT_API_KEY}"
+                        sh "security unlock-keychain -p $USER_CREDENTIALS_PSW && bundle exec fastlane T6_for_Trauma_Public_AppStore_Release app_store_key:'${APPSTORE_CONNECT_API_KEY}'"
+                    }
+                }
+            }
+        }
+        stage('T6 Simulator APP') {
+            when {
+                expression { return params.SIMULATOR_BUILD == true }
+            }
+            steps {
+                dir('src') {
+                    sh "security unlock-keychain -p $USER_CREDENTIALS_PSW && bundle exec fastlane T6_build"
+                }
+            }
+        }
+        stage('Uploading Artifacts to Nexus') {
+            steps {
+                script {
+                    dir('ipa') {
+                        sh "curl -v -k -u $NEXUS_CREDENTIALS_USR:$NEXUS_CREDENTIALS_PSW --http1.1 --upload-file T6.app.dSYM.zip ${NEXUS_URL}/${CURRENT_VERSION}/${BUILD_NUMBER}/T6.app.dSYM.zip"
+                        if(params.SIMULATOR_BUILD){
+                            sh "curl -v -k -u --insecure $NEXUS_CREDENTIALS_USR:$NEXUS_CREDENTIALS_PSW --http1.1 --upload-file T6.app.zip ${NEXUS_URL}/${CURRENT_VERSION}/${BUILD_NUMBER}/T6.app.zip"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post { 
+        success {
+            script {
+                dir('src') {
+                    sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                        sh "security unlock-keychain -p $USER_CREDENTIALS_PSW && bundle exec fastlane run add_git_tag tag:com.t6hs.t6fortrauma.public/${CURRENT_VERSION}/${BUILD_NUMBER}"
+                        sh "security unlock-keychain -p $USER_CREDENTIALS_PSW && bundle exec fastlane run push_git_tags tag:com.t6hs.t6fortrauma.public/${CURRENT_VERSION}/${BUILD_NUMBER}"
+                    }
+                }
+            }
+        }
+    }
+}
