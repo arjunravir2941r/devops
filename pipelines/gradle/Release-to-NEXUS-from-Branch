@@ -1,0 +1,91 @@
+#!groovy
+
+pipeline {
+
+    agent { label 'java17' }
+    
+    parameters {
+        string(
+                defaultValue: '*/develop',
+                description: 'Branch (examples:  */patch/1.1.1, */feature/DEV-XXXX, etc...)',
+                name: 'BRANCH')
+    }
+    
+
+    environment {
+        GIT_URL = 'git@url:backend/t6-admin.git'
+        DIRECTORY = 't6-admin'
+        COMMIT_MESSAGES = ''
+        LATEST_TAG = ''
+    }
+
+    options {
+        checkoutToSubdirectory "t6-admin"
+        ansiColor('xterm')
+    }
+    tools {
+        jdk 'java17'
+    }
+
+    stages {
+
+        stage('Start Build Notification') {
+            steps {
+                slackSend channel: '#backend-releases',
+                        color: '#3399ff',
+                        message: "STARTING:  [${currentBuild.fullDisplayName}]\n" +
+                                "More info at: ${env.BUILD_URL}"
+            }
+        }
+
+        stage('Checkout Branch') {
+            steps {
+                script {
+                    println "Checking-out Branch: [${BRANCH}]"
+                    checkout([$class                           : 'GitSCM',
+                              branches                         : [[name: "${BRANCH}"]],
+                              doGenerateSubmoduleConfigurations: false,
+                              extensions                       : [[$class: 'CleanCheckout'], [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]],
+                              submoduleCfg                     : [],
+                              userRemoteConfigs                : [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@url:backend/t6-admin.git']]
+                    ])
+                }
+            }
+        }
+        
+        stage('Gradle Application Build/Release to Nexus') {
+            steps {
+                sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                    dir("$DIRECTORY") {
+                        script {
+                            sh 'chmod 777 gradlew'
+                            sh './gradlew bootWar --no-daemon'
+                            sh './gradlew publishNexusPublicationToMavenRepository --no-daemon'
+                        }
+                    }
+                }
+            }
+        }        
+
+
+    }
+    post {
+        success {
+            slackSend channel: '#backend-releases',
+                    color: '#52BE80',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName}\n" +
+                            "Was completed and a new artifact was generated\n" +
+                            "From Branch: [$BRANCH]\n" +
+                            "More info at: ${env.BUILD_URL}"
+        }
+        failure {
+
+            slackSend channel: '#backend-releases',
+                    color: '#C0392B',
+                    message: "${currentBuild.result}: Pipeline ${currentBuild.fullDisplayName}\n" +
+                            "More info at: ${env.BUILD_URL}"
+
+        }
+    }
+
+}
