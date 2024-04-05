@@ -1,0 +1,100 @@
+
+pipeline {
+    agent {
+        label 'ios16'
+    }
+    
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '-1', artifactNumToKeepStr: '-1'))
+    }
+
+    environment {
+        DIRECTORY = 'src/T6'
+        GIT_URL = 'git@ip:T6/ipad.git'
+        USER_CREDENTIALS = credentials('admin-mac')
+        LC_ALL = 'en_US.UTF-8'
+        LANG    = 'en_US.UTF-8'
+    }
+    
+    parameters {
+        string(
+            defaultValue: 'develop', 
+            name: 'BRANCH', 
+            trim: true,
+            description: 'Git branch'
+        )
+        string(
+            defaultValue: '3.2.8', 
+            name: 'APP_VERSION', 
+            trim: true,
+            description: "Application version"
+        )
+    }
+    
+    
+    stages {
+        stage('Checkout Sources') {
+            steps {
+                script {
+                    git branch: "${params.BRANCH}", credentialsId: 'Jenkins-Gitlab-Service-Account', url: env.GIT_URL
+                }
+            }
+        }
+        stage('Update Bundle') {
+            steps {
+                script {
+                    dir('src') {
+                        sh "bundle update && bundle install"
+                    }
+                }
+            }
+        }
+        stage('Set App name') {
+            steps {
+                script {
+                    dir('src/T6') {
+                        sh "plutil -replace CFBundleDisplayName -string 'T6' './T6/Info.plist'"
+                    }
+                }
+            }
+        }
+        stage('Set versions') {
+            steps {
+                script {
+                    dir('src/T6') {
+                        ['./T6/Info.plist'].each { app ->
+                            sh "plutil -replace CFBundleShortVersionString -string ${params.APP_VERSION} ${app}"
+                        }
+                    }
+                    dir('src') {
+                        sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                            sh "bundle exec fastlane T6_Set_Build_Number build_number:$BUILD_NUMBER"
+                        }
+                    }
+                    dir('src/T6') {
+                        CURRENT_VERSION = sh script: "agvtool mvers -terse1 | tr -d '\n'", returnStdout: true
+                       
+                    }
+                }
+            }
+        }
+        stage('Update Dependencies') {
+            steps {
+                dir('src') {
+                    sh 'bundle install'
+                    sh 'pod repo update --silent'
+                    sh 'pod install'
+                }
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                dir("$DIRECTORY") {
+                    sh "chmod +x run-sonar-swift.sh"
+                    sh './run-sonar-swift.sh -v'
+                }
+            }
+        }
+    }
+}
