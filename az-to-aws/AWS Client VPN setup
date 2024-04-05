@@ -1,0 +1,40 @@
+This is the documentation  for the client VPN setup. AWS Client VPN is a managed client-based VPN service that enables you to securely access your AWS resources and resources in your on-premises network. With Client VPN, you can access your resources from any location using an OpenVPN-based VPN client.
+
+Open VPN-Setup.jpg
+VPN-Setup.jpg
+
+With mutual authentication, Client VPN uses certificates to perform authentication between the client and the server. Certificates are a digital form of identification issued by a certificate authority (CA). The server uses client certificates to authenticate clients when they attempt to connect to the Client VPN endpoint. You must create a server certificate and key, and at least one client certificate and key.
+
+Install AWS cli over the machine where you created the certificates to upload the certificate to certificate manager in AWS
+
+
+Install aws cli : Install or update the latest version of the AWS CLI - AWS Command Line Interface (amazon.com)
+
+Generate the key by the below documentation:
+Mutual authentication : Mutual authentication - AWS Client VPN (amazon.com)
+
+Configuration of Client VPN : 
+
+Create Client VPN using below documentation
+Getting started with AWS Client VPN - AWS Client VPN (amazon.com)
+
+Reference Vedio : AWS Client VPN Tutorial - Setup AWS Client VPN from scratch - YouTube
+
+Points to remember : 
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+CIDR of client VPN and VPC should not be same 
+
+Once you upload the key to acm 
+IN client VPN creation step 
+Server certificate ARN : select the server key from certificate manager in aws
+
+Enable mutual authentication 
+Select the appropriate client key from certificate manager
+
+Its not necessary to change the Client VPN endpoint DNS name.
+
+Enable split tunneling : otherwise the user will be loose internet when this VPN is connected or else the routing should be enables inside the AWS security groups and this may leas to high cost
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
