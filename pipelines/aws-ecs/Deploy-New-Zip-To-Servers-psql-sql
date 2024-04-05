@@ -1,0 +1,1007 @@
+#!groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+import java.util.regex.Pattern
+
+def wsVersions = ['n/a']
+def adminVersions = ['n/a']
+def centralVersions = ['n/a']
+def envs = ['n/a'] 
+def choiceArray = []
+def albName = 'T6-DEV-ALB'
+def albArn = ''
+def listenerArn = ''
+def taskDefinitions = [:]  // Declare taskDefinitions here
+def targetGroups = [:]  // Declare targetGroups
+def listenerPort = 443
+def handleError(message, exitPipeline = true) {
+    echo "ERROR: ${message}"
+    currentBuild.result = 'FAILURE'
+    if (exitPipeline) {
+        error(message)
+    }
+}
+def admin_combine_env
+def central_combine_env
+def ws_combine_env
+
+def nexusUrl = "http://10.10.100.9:8081"
+def queryUrlsnapshot = "${nexusUrl}/service/rest/v1/search?repository=t6hs-snapshots&group=com.t6hs&name="
+def queryUrl = "${nexusUrl}/service/rest/v1/search?repository=t6hs-releases&group=com.t6hs&name="
+def t6RepoUrl = "${nexusUrl}/repository/t6hs-releases"
+def metadatabackendVersions = ['n/a']
+def baseVersions
+def originalDbtoolsVersion
+def combinedVersions
+
+def readFileContent(String file) {
+    return readFile(file).trim()
+}
+
+def parseEnvVariables(String envVars) {
+    def envList = []
+    envVars.split('\n').each { line ->
+        if (!line.startsWith("#") && line.contains('=')) {
+            def (key, value) = line.split('=', 2)
+            envList << [name: key.trim(), value: value.trim()]
+        }
+    }
+    return envList // Corrected return statement
+}
+// A helper method to fetch image tags from AWS ECR
+def fetchImageTags(String repositoryName) {
+    def command = "aws ecr list-images --region us-east-1 --repository-name ${repositoryName} --output json"
+    def output = sh(script: command, returnStdout: true).trim()
+    def json = new JsonSlurperClassic().parseText(output)
+    def tags = json.imageIds.collect { it.imageTag }.findAll { it != null }
+    return tags.isEmpty() ? ['n/a'] : tags
+}
+
+def getLogConfiguration(String serverName, String containerType) {
+    return [
+        logDriver: "awslogs",
+        options: [
+            "awslogs-group": "T6-Devops-Migration-DEV-LOGS",
+            "awslogs-region": "${AWS_REGION}",
+            "awslogs-stream-prefix": "${serverName}/${containerType}"
+        ]
+    ]
+}
+
+def fetchHighestPriority(String listenerArn) {
+    def command = "aws elbv2 describe-rules --listener-arn ${listenerArn} --region ${AWS_REGION} --query 'Rules[].Priority' --output text"
+    def output = sh(script: command, returnStdout: true).trim()
+    
+    // Filter out 'default' and any non-integer values
+    def priorities = output.split("\\s+").findAll { it.isInteger() }.collect { it as Integer }
+
+    return priorities ? priorities.max() : 0
+}
+// Helper method to check if a string is an integer
+String.metaClass.isInteger = {
+    delegate ==~ /\d+/
+}
+
+def updateTaskDefinition(containerConfigs) {
+    TASKFAMILY = "${params.servername}-task"
+    def cpu, memory
+
+    // Set CPU and Memory based on resource usage
+    switch (resourceUsage) {
+        case 'low':
+            cpu = 1024
+            memory = 2048
+            break
+        case 'medium':
+            cpu = 2048
+            memory = 4096
+            break
+        case 'high':
+            cpu = 4096
+            memory = 8192
+            break
+        default:
+            echo "Invalid resource usage selected. Using default values (low)."
+            cpu = 1024
+            memory = 2048
+    }
+
+    def containerDefinitions = containerConfigs.collect { config ->
+        def logConfig = JsonOutput.toJson(config.logConfiguration).toString()
+        """
+        {
+            "name": "${params.servername}-${config.containerType}",
+            "image": "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${config.repositoryName}:${config.imageVersion}",
+            "memoryReservation": 256,
+            "essential": true,
+            "portMappings": [{
+                "containerPort": ${config.containerport},
+                "hostPort": ${config.containerport}
+            }],
+            "entryPoint": [],
+            "command": [],
+            "environment": ${JsonOutput.toJson(config.taskDefEnv)},
+            "logConfiguration": ${logConfig}
+        }
+        """
+    }.join(',') 
+    echo "Container Definitions JSON: ${containerDefinitions}"
+    def taskDefArn = sh(script: """
+        aws ecs register-task-definition \
+            --region ${AWS_REGION} \
+            --family ${TASKFAMILY} \
+            --container-definitions '[${containerDefinitions}]' \
+            --requires-compatibilities FARGATE \
+            --cpu ${cpu} \
+            --memory ${memory} \
+            --task-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole \
+            --execution-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole \
+            --network-mode awsvpc \
+            --output json \
+            --query 'taskDefinition.taskDefinitionArn'
+    """, returnStdout: true).trim()
+    echo "ECS Task Definition ARN: ${taskDefArn}"
+    return taskDefArn
+}
+
+
+
+
+@Library(['sortVersions', 'getNexusArtifactVersions', 'getNexusArtifactZipFilesPath']) _
+
+node('AWS-AGENT1') {
+script {
+        def metadatabackendVer = getNexusArtifactVersions("${queryUrl}t6-metadata-backend")
+        metadatabackendVersions = metadatabackendVer.sort().reverse()
+        def dbtoolsVer = getNexusArtifactVersions("${queryUrlsnapshot}t6-dbtools")
+        dbtoolsVersions = dbtoolsVer.sort().reverse()
+        def dbtoolsVerReleases = getNexusArtifactVersions("${queryUrl}t6-dbtools")
+        dbtoolsVersionsReleases = dbtoolsVerReleases.sort().reverse()
+        def versionString = dbtoolsVersions
+        baseVersions = versionString.collect { version ->
+            version.replaceAll("-(?=[^-]*-[^-]*\$).*", "-SNAPSHOT")
+        }
+        if ("${params.environment}" != 'n/a') {
+            envs = [params.environment]
+        }
+        def dbtoolsZipFiles = getNexusArtifactZipFilesPath("${queryUrlsnapshot}t6-dbtools")
+        dbtoolsZipFilesPaths = dbtoolsZipFiles.sort().reverse()        
+        // Find the original dbtoolsVersion based on the selected baseVersion
+        def selectedBaseVersion = params.dbtoolsVersion.replaceAll("-SNAPSHOT", "")        
+        originalDbtoolsVersion = dbtoolsVersions.find { it.contains(selectedBaseVersion) }
+        combinedVersions = baseVersions + dbtoolsVersionsReleases
+
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            
+            wsVersions = fetchImageTags('t6-webservice')
+            adminVersions = fetchImageTags('t6-admin')
+            centralVersions = fetchImageTags('t6-central')
+        }
+    }
+}
+
+def determineDatabaseDetails() {
+    def dbConfig = [:]
+    switch (params.databaseType) {
+        case 'SQL':
+            dbConfig.url = "rdssqlurl"
+            dbConfig.jdbcUrl = "jdbc:sqlserver://${dbConfig.url}"
+            dbConfig.commandTool = "sqlcmd -S"
+            break
+        case 'PostgreSQL':
+            dbConfig.url = "rdspsqlurl"
+            dbConfig.jdbcUrl = "jdbc:postgresql"
+            dbConfig.commandTool = "psql -h "
+            break
+    }
+    return dbConfig
+}
+
+
+
+pipeline {
+    agent { label 'aws-agent1' }
+
+    parameters {
+        
+        choice name: 'parameterize',
+            choices: ['Yes', 'No'],
+            description: "Do you wish to do a dry run to grab/update parameters?\n" +
+                    " - It is recommended to run with in this mode before deploy"
+
+        choice(name: 'metadata-backend-Version',
+               choices: metadatabackendVersions,
+               description: 'Select Metadata Backend Version')
+               
+        string(name: 'CLIENT', defaultValue: 'DEV-STRSMETA', description: 'Client identifier')
+        
+        string(name: 'VERSION', defaultValue: 'null', description: 'Version string , please provide the latest version')
+        
+        string(name: 'modeljs-version', defaultValue: '2.0.0', description: 'Model.js version to be used')
+
+        string(name: 'servername', 
+            defaultValue: 'null', 
+            description: 'Give Server Name to deploy, e.g. dev1, node20')
+
+
+        choice name: 'databaseType',
+            choices: ['SQL', 'PostgreSQL'],
+            description: 'Select the database type'
+
+        choice name: 'dbtoolsVersion',
+            choices: combinedVersions,
+            description: 'DBtool-version'
+
+
+        choice name: 'dbstrategy', 
+            choices: ['true', 'false'], 
+            description: 'Create new: true / Upgrade existing: false'
+
+        choice name: 'userset', 
+            choices: [ 'ad-JOMIS-ALL', 'ad-JOMIS-F-ALL', 'ad-JOMIS-F-DEV', 'ad-JOMIS-ADMIN'], 
+            description: 'Choose the userset'
+
+        
+        
+        choice name: 'Central_Database',
+            choices: ['No', 'Yes'],
+            description: 'Select Yes IF you want to create database for central'
+
+        choice(name: 'wsVersion', choices: wsVersions, description: 'T6 Webservice version')
+        choice(name: 'adminVersion', choices: adminVersions, description: 'T6 Admin version')
+        choice(name: 'centralVersion', choices: ['NONE'] + centralVersions, description: 'T6 Central version (OPTIONAL)')
+        choice(name: 'VALIDATE_CONF', choices: ['yes', 'no'], description: 'Validate configuration option for configuration.properties file')     
+        choice(name: 'resourceUsage', choices: ['low', 'medium', 'high'], description: 'low (CPU: 1GB, Memory: 2GB), medium (CPU: 2GB, Memory: 4GB), high (CPU: 4GB, Memory: 8GB)')
+    }
+    
+    environment {
+        NEXUS_URL = 'http://10.10.100.9:8081'
+        DB_STRATEGY = "${params.dbstrategy}"
+        DB_NAME = "${params.servername}"
+        USER_SET = "${params.userset}"
+        DBTOOLS_VERSION = "${params.dbtoolsVersion}"
+        DIRECTORY = 'mwe-testing'
+        AWS_DEFAULT_REGION="us-east-1"
+        AWS_REGION = "us-east-1"
+        AWS_CREDENTIALS_Jenkins=credentials('aws-creds')
+        AWS_ACCOUNT_ID = '404678654041'
+        ECS_CLUSTER_NAME = 't6-ecs-dev'
+        VPC_ID = 'vpc-0dc9dcbf253012078'
+        PRIVATE_SUBNET_ID = 'subnet-02f5f8a895cb376b3'
+        SUBNETS = "subnet-02f5f8a895cb376b3 subnet-008fc226729b65b71"
+        SECURITY_GROUP_ID = 'sg-0cbda573dd471a741'
+        SECURITY_GROUP_ECS = 'sg-0cbda573dd471a741'
+        TG_PATH_ADMIN = "${SERVER_NAME}/admin"
+        TG_PATH_CENTRAL = "${SERVER_NAME}/central"
+        TG_PATH_WS = "${SERVER_NAME}/ws"
+        TASKFAMILY = ''
+
+        
+    }
+
+    stages {
+        
+        stage("Parameterizing Job") {
+        
+            steps {
+                script {
+                    if ("${params.parameterize}" == "Yes") {
+                        currentBuild.result = 'ABORTED'
+                        error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+                    }
+                }
+            }
+        }
+
+        stage('Prepare Environment') {
+            steps {
+                script {
+                    def versionComponents = params.VERSION.tokenize('.')
+                    def lastComponent = versionComponents[-1].toInteger() + 1
+                    versionComponents[-1] = lastComponent.toString()
+                    newVersion = versionComponents.join('.')
+                    env.newVersion = newVersion
+
+                    echo "New version: ${newVersion}"
+                    
+                    sh 'sudo netstat -tulnp | grep :8583 && sudo kill -9 $(sudo netstat -tulnp | grep :8583 | awk "{print \$7}" | cut -d"/" -f1) || echo "Port 8583 is free"'
+                    def metadataBackendVersion = params['metadata-backend-Version']
+                    sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata-backend/${metadataBackendVersion}/t6-metadata-backend-${metadataBackendVersion}.jar"
+
+                }
+            }
+        }
+        stage('Clone Metadata') {
+            steps {
+                script {
+                    
+                    println "Checking out the ${params.CLIENT} branch"
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${params.CLIENT}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanCheckout'],
+                            [$class: 'RelativeTargetDirectory', relativeTargetDir: "/home/t6admin/ipad-metadata"]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@dev-gitlab.t6cloud.com:ipaddev/metadata.git']]
+                    ])
+                }
+            }
+        }
+        stage('Handle model.js File') {
+            steps {
+                script {
+                    // Deleting the existing model.js file
+                    sh "rm -f /home/t6admin/ipad-metadata/jsMetadata/model.js"
+                    println "Deleted existing model.js file."
+        
+                    // Constructing and echoing the download URL
+                    def modelJsUrl = "${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-model-js/${params.CLIENT}/${params['modeljs-version']}/model.js"
+                    echo "Download URL: ${modelJsUrl}"
+        
+                    // Downloading the new model.js file from Nexus
+                    sh "curl -sS -L ${modelJsUrl} -o /home/t6admin/ipad-metadata/jsMetadata/model.js"
+                    println "Downloaded new model.js file."
+                }
+            }
+        }
+        stage('Run Java Application and Download Metadata') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USERNAME', passwordVariable: 'DB_PASSWORD')]) {
+                        def metadataBackendVersion = params['metadata-backend-Version']
+                        echo "Running Metadata Backend Version: ${metadataBackendVersion}"
+                        sh """
+                        nohup java -jar t6-metadata-backend-${metadataBackendVersion}.jar \\
+                        "--spring.datasource.url=jdbc:sqlserver://t6-internal-rds.chlyypksqpgf.us-east-1.rds.amazonaws.com:1433;databaseName=mweb1" \\
+                        "--server.servlet.context-path=/metadata" \\
+                        "--t6.roles=ad-jomis-all" \\
+                        "--nexus.url=${NEXUS_URL}/service/rest/v1/components?repository=t6hs-releases" \\
+                        "--spring.datasource.password=\${DB_PASSWORD}" \\
+                        "--spring.datasource.username=\${DB_USERNAME}" \\
+                        "--server.port=8583" \\
+                        "--git.metadata.repo.dir=/home/t6admin/ipad-metadata" > output.log 2>&1 & echo \$! > process.pid
+                        """
+                        sleep(30) // Wait for the application to fully start
+                        echo "Attempting to download metadata..."
+                        sh "curl -o 't6-metadata-${env.newVersion}.zip' 'http://localhost:8583/metadata/public/generateMetadataZip?client=${params.CLIENT}&version=${params.VERSION}'"
+                    }
+                }
+            }
+        }
+
+
+        stage('Upload to Nexus') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'Nexus', usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                    sh """
+                    echo "Uploading t6-metadata-${env.newVersion}.zip to Nexus"
+                    echo "URL: ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${env.newVersion}/t6-metadata-${env.newVersion}.zip"
+                    curl -v -u $NEXUS_USERNAME:$NEXUS_PASSWORD --upload-file 't6-metadata-${env.newVersion}.zip' \
+                    '${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${env.newVersion}/t6-metadata-${env.newVersion}.zip'
+                    """
+                }
+            }
+        }
+
+
+        stage('Delete Existing Resources') {
+            
+            steps {
+                script {
+                    echo "Deleting existing resources..."
+
+                    // Delete ECS service
+                    def ecsServiceName = "${params.servername}-service" // Substituted ecsServiceName
+
+                    // Check if the service exists
+                    def serviceExists = sh(script: """
+                        aws ecs describe-services --cluster t6-ecs-dev --services ${ecsServiceName} --region ${AWS_REGION} --query 'services[0].status' --output text
+                    """, returnStdout: true).trim()
+                    //def updateServiceResult
+                    if (serviceExists != 'ACTIVE') {
+                        echo "ECS service ${ecsServiceName} does not exist. Nothing to delete."
+                        
+                    } else {
+                        // Update service to have a desired count of 0
+                        sh """
+                            aws ecs update-service \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service ${ecsServiceName} \
+                                --desired-count 0
+                        """
+
+                        // Get task ARNs
+                        def taskArns = sh(script: """
+                            aws ecs list-tasks \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service-name ${ecsServiceName} \
+                                --query 'taskArns' \
+                                --output text
+                        """, returnStdout: true).trim()
+
+                        // Stop each task
+                        if (taskArns) {
+                            taskArns.split().each { taskArn ->
+                                def taskId = taskArn.tokenize('/').last()
+                                sh """
+                                    aws ecs stop-task \
+                                        --region ${AWS_REGION} \
+                                        --cluster t6-ecs-dev \
+                                        --task ${taskId}
+                                """
+                            }
+
+                            // Wait for all tasks to be stopped
+                            echo "Waiting for tasks to be stopped..."
+                            sh """
+                                aws ecs wait tasks-stopped \
+                                    --region ${AWS_REGION} \
+                                    --cluster t6-ecs-dev \
+                                    --tasks ${taskArns}
+                            """
+                        }
+
+                        // Delete ECS service
+                        echo "Deleting existing ECS service..."
+                        sh """
+                            aws ecs delete-service \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --service ${ecsServiceName} \
+                                --force
+                        """
+
+                        // Wait for Service to Drain
+                        sh """
+                            aws ecs wait services-inactive \
+                                --region ${AWS_REGION} \
+                                --cluster t6-ecs-dev \
+                                --services ${ecsServiceName} 
+                        """
+                        echo "Services have stabilized."
+
+                       
+
+                    }
+                }
+            }
+        }
+
+        stage("Check and Create Database") {
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                        if (params.databaseType == 'SQL') {
+                            // SQL command
+                            def listDatabasesCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"SELECT name FROM sys.databases WHERE name = '${params.servername}'\""
+                            def dbListOutput = sh(script: listDatabasesCmd, returnStdout: true).trim()
+                            boolean dbExists = dbListOutput.split('\n').any { line -> line.trim().equalsIgnoreCase(params.servername) }
+                            if (dbExists) {
+                                echo "Database '${params.servername}' already exists."
+                            } else {
+                                echo "Database '${params.servername}' does not exist. Creating..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"CREATE DATABASE ${params.servername}\""
+                            }
+                        } else if (params.databaseType == 'PostgreSQL') {
+                            // PostgreSQL command
+                            // Temporarily set PGPASSWORD for the duration of this script block
+                            withEnv(["PGPASSWORD=${DB_PASS}"]) {
+                                def checkDbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"SELECT 1 FROM pg_database WHERE datname='${params.servername}';\""
+                                def dbExistsOutput = sh(script: checkDbExistsCmd, returnStdout: true).trim()
+                                boolean dbExists = dbExistsOutput.contains("1")
+                                if (dbExists) {
+                                    echo "Database '${params.servername}' already exists."
+                                } else {
+                                    echo "Database '${params.servername}' does not exist. Creating..."
+                                    sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"CREATE DATABASE ${params.servername};\""
+                                }
+                            }
+                            // PGPASSWORD will be automatically unset after the withEnv block
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+
+
+        stage("Check, Delete, and Recreate Central Database") {
+            when {
+                expression { params.Central_Database == 'Yes' }
+            }
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                        def centralDbName = "central_${params.servername}"
+                        echo "Processing Central Database: ${centralDbName}"
+
+                        if (params.databaseType == 'SQL') {
+                            // SQL commands for checking, deleting, and creating the central database
+                            def dbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"SELECT name FROM sys.databases WHERE name = '${centralDbName}'\""
+                            def dbExists = sh(script: dbExistsCmd, returnStdout: true).trim()
+
+                            if (dbExists.contains(centralDbName)) {
+                                echo "Central Database '${centralDbName}' exists. Deleting..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"DROP DATABASE ${centralDbName}\""
+                            }
+
+                            echo "Creating Central Database '${centralDbName}'..."
+                            sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -P ${DB_PASS} -Q \"CREATE DATABASE ${centralDbName}\""
+
+                        } else if (params.databaseType == 'PostgreSQL') {
+                            // PostgreSQL commands for checking, deleting, and creating the central database
+                            withEnv(["PGPASSWORD=${DB_PASS}"]) {
+                                def checkDbExistsCmd = "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"SELECT 1 FROM pg_database WHERE datname='${centralDbName}';\""
+                                def dbExistsOutput = sh(script: checkDbExistsCmd, returnStdout: true).trim()
+                                boolean dbExists = dbExistsOutput.contains("1")
+
+                                if (dbExists) {
+                                    echo "Central Database '${centralDbName}' exists. Deleting..."
+                                    sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"DROP DATABASE IF EXISTS ${centralDbName};\""
+                                }
+
+                                echo "Creating Central Database '${centralDbName}'..."
+                                sh "${dbConfig.commandTool} ${dbConfig.url} -U ${DB_USER} -d postgres -c \"CREATE DATABASE ${centralDbName};\""
+                            }
+                            // PGPASSWORD will be automatically unset after the withEnv block
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('DB-Updation') {
+            steps {
+                script {
+                    def dbConfig = determineDatabaseDetails()
+                    dir("$DIRECTORY") {
+                        withCredentials([usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USER', passwordVariable: 'DB_PASS')]) {
+                            println("Building db ")
+                            if (params.dbtoolsVersion.contains("SNAPSHOT")) {
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-snapshots/com/t6hs/t6-dbtools/${DBTOOLS_VERSION}/t6-dbtools-${originalDbtoolsVersion}.zip"
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${env.newVersion}/t6-metadata-${env.newVersion}.zip"
+                                sh script: "unzip t6-dbtools-${originalDbtoolsVersion}.zip"
+                            } else {
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-dbtools/${DBTOOLS_VERSION}/t6-dbtools-${DBTOOLS_VERSION}.zip"
+                                sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-metadata/${env.newVersion}/t6-metadata-${env.newVersion}.zip"
+                                sh script: "unzip  -o t6-dbtools-${DBTOOLS_VERSION}.zip"
+                            }
+
+                            def inDirPath = "t6-dbtools-${DBTOOLS_VERSION}/in"
+                            if (fileExists(inDirPath)) {
+                                sh "rm -rf ${inDirPath}/*"
+                            } else {
+                                sh "mkdir ${inDirPath}"
+                            }
+                            sh "cp t6-metadata-${env.newVersion}.zip t6-dbtools-${DBTOOLS_VERSION}/in/"
+                            sh "mv t6-dbtools-${DBTOOLS_VERSION}/in/t6-metadata-${env.newVersion}.zip t6-dbtools-${DBTOOLS_VERSION}/in/metadata-6.zip"
+                            dir("t6-dbtools-${DBTOOLS_VERSION}") {
+                                if (params.databaseType == 'SQL') {
+                                    // Use SQL JDBC URL format
+                                    sh "java -jar ./lib/t6-dbtools-${DBTOOLS_VERSION}.jar --metadata-directory ./in/ --database ${DB_NAME} --authentication-type jdbc-url --mapping-file ${USER_SET} --full-deployment --datasource-url '${dbConfig.jdbcUrl};username=${DB_USER};password=${DB_PASS};databaseName=${DB_NAME};trustServerCertificate=true;'"
+                                } else if (params.databaseType == 'PostgreSQL') {
+                                    // Use PostgreSQL JDBC URL format
+                                    def jdbcUrl = "jdbc:postgresql://${dbConfig.url}:5432/${DB_NAME}?user=${DB_USER}&password=${DB_PASS}&currentSchema=dbo"
+                                    sh "java -jar ./lib/t6-dbtools-${DBTOOLS_VERSION}.jar --metadata-directory ./in/ --database ${DB_NAME} --authentication-type jdbc-url --mapping-file ${USER_SET} --full-deployment --datasource-url '${jdbcUrl}'"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Get Ports') {
+            steps {
+                script {
+                    def workspacePath = env.WORKSPACE
+                    def adminFilePath = "${workspacePath}/CONFIGS/admin_params.env"
+                    def wsFilePath = "${workspacePath}/CONFIGS/webservice_params.env"
+                    def centralFilePath = "${workspacePath}/CONFIGS/central_params.env"
+                    //Read the admin port
+                    if (fileExists(adminFilePath)) {
+                        env.CONTAINER_PORT_ADMIN = sh(
+                            script: "grep SERVER_PORT ${adminFilePath} | cut -d'=' -f2",
+                            returnStdout: true
+                        ).trim()
+                    }
+                    // Read the webservice port
+                    if (fileExists(wsFilePath)) {
+                        env.CONTAINER_PORT_WS = sh(
+                            script: "grep SERVER_PORT ${wsFilePath} | cut -d'=' -f2",
+                            returnStdout: true
+                        ).trim()
+                    }
+                    // Read the central port
+                    if (fileExists(centralFilePath)) {
+                        env.CONTAINER_PORT_CENTRAL = sh(
+                            script: "grep SERVER_PORT ${centralFilePath} | cut -d'=' -f2",
+                            returnStdout: true
+                        ).trim()
+                    } 
+                }
+            }
+        }
+
+        stage('Check ECS Cluster') {
+            steps {
+                script {
+                    def clusterStatus = sh(script: """
+                        aws ecs describe-clusters --cluster ${ECS_CLUSTER_NAME} --region ${AWS_REGION} --query 'clusters[0].status' --output text
+                    """, returnStdout: true).trim()
+
+                    echo "Cluster Status: ${clusterStatus}"
+                }
+            }
+        }
+        stage('Check ALB and Create Listener') {
+            steps {
+                script {                    
+                    def albExists = sh(script: """
+                        aws elbv2 describe-load-balancers --names ${albName} --region ${AWS_REGION} --query 'LoadBalancers' --output text
+                    """, returnStatus: true) == 0   
+                    echo "ALB Exists?: ${albExists}"
+                    
+                    albArn = sh(script: """
+                    aws elbv2 describe-load-balancers --names ${albName} --region ${AWS_REGION} --query 'LoadBalancers[0].LoadBalancerArn' --output text
+                """, returnStdout: true).trim()
+
+                    // Check if the listener exists
+                    def listenerExists = sh(script: """
+                        aws elbv2 describe-listeners --load-balancer-arn ${albArn} --region ${AWS_REGION} --query 'Listeners[0].ListenerArn' --output text
+                    """, returnStdout: true).trim()
+
+                    echo "ListenerArnOutput: ${listenerExists}"
+                    
+                    if (listenerExists) {
+                        // Listener exists, get its ARN
+                        listenerArn = listenerExists
+                        echo "Listener Already Exists. ARN: ${listenerArn}"
+                    } else {
+                        // Create Listener
+                        listenerArn = sh(script: """
+                        aws elbv2 create-listener \
+                            --load-balancer-arn ${albArn} \
+                            --protocol HTTP \
+                            --port ${listenerPort} \
+                            --default-actions Type=fixed-response,FixedResponseConfig={ContentType=text/plain,StatusCode=200,MessageBody=OK} \
+                            --region ${AWS_REGION} \
+                            --output text \
+                            --query 'Listeners[0].ListenerArn'
+                    """, returnStdout: true).trim()
+
+                    echo "Listener Created. ARN: ${listenerArn}"
+                    }
+
+                }
+            }
+        }
+        //admin_params
+        stage('Update JAVA_OPTS') {
+            steps {
+                script {
+                    dir("./CONFIGS/") {
+                        def filePath_web = 'webservice_params.env'
+                        def filePath_admin = 'admin_params.env'
+                        def fileContent_web = readFile(filePath_web)
+                        def fileContent_admin = readFile(filePath_admin)
+                        
+                        if (params.VALIDATE_CONF == 'yes') {
+                            if (!fileContent_web.contains("-Dt6.validate.configuration=true")) {
+                                fileContent_web = fileContent_web.replaceAll("(JAVA_OPTS=.*?)(\$)", "\$1 -Dt6.validate.configuration=true\$2")
+                            }
+                            if (!fileContent_admin.contains("-Dt6.validate.configuration=true")) {
+                                fileContent_admin = fileContent_admin.replaceAll("(JAVA_OPTS=.*?)(\$)", "\$1 -Dt6.validate.configuration=true\$2")
+                            }
+                        } else {
+                            fileContent_web = fileContent_web.replaceAll(" -Dt6.validate.configuration=true", "")
+                            fileContent_admin = fileContent_admin.replaceAll(" -Dt6.validate.configuration=true", "")
+                        }
+                        writeFile file: filePath_web, text: fileContent_web
+                        writeFile file: filePath_admin, text: fileContent_admin
+                        echo "Updated webservice_params.env:\n${fileContent_web}"
+                        echo "Updated admin_params.env:\n${fileContent_admin}"
+                    }
+                }
+            }
+        }
+        stage('Pull Environment Variables from Jenkins Workspace') {
+            steps {
+                script {                  
+                    def workspacePath = env.WORKSPACE
+                    def SPRING_DATABASE_ADMIN_WS = ''
+                    def SPRING_DATABASE_CENTRAL = ''
+                    echo "Database Type: ${params.databaseType}"
+
+                    if (params.databaseType == 'SQL') {
+                        SPRING_DATABASE_ADMIN_WS = 'jdbc:sqlserver://t6-internal-rds.chlyypksqpgf.us-east-1.rds.amazonaws.com:1433;databaseName=INPUT_SERVER_VALUE;trustServerCertificate=true;'
+                        SPRING_DATABASE_CENTRAL = 'jdbc:sqlserver://t6-internal-rds.chlyypksqpgf.us-east-1.rds.amazonaws.com:1433;databaseName=central_INPUT_SERVER_VALUE;trustServerCertificate=true;'
+                    } else {
+                        SPRING_DATABASE_ADMIN_WS = 'jdbc:postgresql://t6-dev-rds-psql.chlyypksqpgf.us-east-1.rds.amazonaws.com:5432/INPUT_SERVER_VALUE?currentSchema=dbo'
+                        SPRING_DATABASE_CENTRAL = 'jdbc:postgresql://t6-dev-rds-psql.chlyypksqpgf.us-east-1.rds.amazonaws.com:5432/central_INPUT_SERVER_VALUE?currentSchema=dbo'
+                    }
+
+                    // Read the file into a variable
+                    def fileContent_admin = readFile './CONFIGS/admin_params.env'
+                    def fileContent_central = readFile './CONFIGS/central_params.env'
+                    def fileContent_central_main = readFile './CONFIGS/central_main_params.env'
+                    def fileContent_ws = readFile './CONFIGS/webservice_params.env'
+
+                  
+                    fileContent_admin = fileContent_admin.replaceAll('DATABASE_PLACEHOLDER', SPRING_DATABASE_ADMIN_WS)
+                    fileContent_central = fileContent_central.replaceAll('DATABASE_PLACEHOLDER', SPRING_DATABASE_CENTRAL)
+                    fileContent_ws = fileContent_ws.replaceAll('DATABASE_PLACEHOLDER', SPRING_DATABASE_ADMIN_WS)
+
+                    // Replace the placeholder with the SERVER_NAME parameter
+                    fileContent_admin = fileContent_admin.replaceAll('INPUT_SERVER_VALUE', params.servername)
+                    fileContent_central = fileContent_central.replaceAll('INPUT_SERVER_VALUE', params.servername)
+                    fileContent_ws = fileContent_ws.replaceAll('INPUT_SERVER_VALUE', params.servername)
+
+
+                    
+                    writeFile file: './CONFIGS/admin_params.env', text: fileContent_admin
+                    writeFile file: './CONFIGS/central_params.env', text: fileContent_central
+                    writeFile file: './CONFIGS/webservice_params.env', text: fileContent_ws
+
+
+                    // Define paths for environment variable files
+                    def adminEnvFile = "${workspacePath}/CONFIGS/admin_params.env"
+                    def centralEnvFile = "${workspacePath}/CONFIGS/central_params.env"
+                    def wsEnvFile = "${workspacePath}/CONFIGS/webservice_params.env"
+                    
+                    def configsetEnvFile = "${workspacePath}/configset/Standard/configset.env"
+                    def credentialsEnvFile = "/opt/t6/credentials/credentials.env"
+
+                    // Combine contents of environment variable files
+                    ws_combine_env = readFileContent(credentialsEnvFile) + "\n" + readFileContent(wsEnvFile) + "\n" + readFileContent(configsetEnvFile)
+                    admin_combine_env = readFileContent(credentialsEnvFile) + "\n" + readFileContent(adminEnvFile) + "\n" + readFileContent(configsetEnvFile)
+                    central_combine_env = readFileContent(centralEnvFile)
+
+              
+                }
+            }
+        }
+
+        stage('Create ECS Task Definitions and Services') {
+            steps {
+                script {
+                    def containerConfigs = []
+                    if ("${params.centralVersion}" != 'NONE') {
+                        containerConfigs = [
+                            [
+                                containerType: "admin",
+                                repositoryName: "t6-admin",
+                                imageVersion: "${params.adminVersion}",
+                                taskDefEnv: parseEnvVariables(admin_combine_env),
+                                containerport: "${env.CONTAINER_PORT_ADMIN}",
+                                logConfiguration: getLogConfiguration("${params.servername}", "admin")
+                            ],
+                            [
+                                containerType: "central",
+                                repositoryName: "t6-central",
+                                imageVersion: "${params.centralVersion}",
+                                taskDefEnv: parseEnvVariables(central_combine_env),
+                                containerport: "${env.CONTAINER_PORT_CENTRAL}",
+                                logConfiguration: getLogConfiguration("${params.servername}", "central")
+
+                            ],
+                            [
+                                containerType: "ws",
+                                repositoryName: "t6-webservice",
+                                imageVersion: "${params.wsVersion}",
+                                taskDefEnv: parseEnvVariables(ws_combine_env),
+                                containerport: "${env.CONTAINER_PORT_WS}",
+                                logConfiguration: getLogConfiguration("${params.servername}", "ws")
+
+                            ]
+                        ]
+                    }
+                    else {
+                        containerConfigs = [
+                        [
+                            containerType: "admin",
+                            repositoryName: "t6-admin",
+                            imageVersion: "${params.adminVersion}",
+                            taskDefEnv: parseEnvVariables(admin_combine_env),
+                            containerport: "${env.CONTAINER_PORT_ADMIN}",
+                            logConfiguration: getLogConfiguration("${params.servername}", "admin")
+                        ],
+                        [
+                            containerType: "ws",
+                            repositoryName: "t6-webservice",
+                            imageVersion: "${params.wsVersion}",
+                            taskDefEnv: parseEnvVariables(ws_combine_env),
+                            containerport: "${env.CONTAINER_PORT_WS}",
+                            logConfiguration: getLogConfiguration("${params.servername}", "ws")
+
+                        ]
+                    ]
+                    }
+                    echo "Container Configs set"
+                    def taskDefArn = updateTaskDefinition(containerConfigs)                   
+                    echo "ECS Task Definition ARN: ${taskDefArn}"
+                    // Define a map to store listener port for each container type
+                    def containerPorts = [
+                        admin: "${env.CONTAINER_PORT_ADMIN}",
+                        ws: "${env.CONTAINER_PORT_WS}",
+                        central: "${env.CONTAINER_PORT_CENTRAL}"
+                    ]
+                    // Create Target Group and Listener Rules for Each Container Type
+                    def highestPriority = fetchHighestPriority(listenerArn)
+                    def newPriority = highestPriority + 1
+
+                    def containerTypes = ["admin", "ws"]
+                    if ("${params.centralVersion}" != 'NONE') {
+                        containerTypes.add("central")
+                    }   
+
+                    for (def containerType in containerTypes) {
+                        def targetGroupName = "${params.servername}-${containerType}-target-group"
+                        def containerPort = containerPorts[containerType]                       
+                        // Check if the target group already exists
+                        def targetGroupExists = sh(script: """
+                            aws elbv2 describe-target-groups \
+                                --names ${targetGroupName} \
+                                --region ${AWS_REGION} \
+                                --query 'TargetGroups' \
+                                --output text
+                        """, returnStatus: true) == 0
+
+                        // Create the target group if it doesn't exist
+                        if (!targetGroupExists) {
+                            def targetGroupArn = sh(script: """
+                                aws elbv2 create-target-group \
+                                    --name ${targetGroupName} \
+                                    --protocol HTTP \
+                                    --port ${listenerPort} \
+                                    --target-type ip \
+                                    --vpc-id ${VPC_ID} \
+                                    --region ${AWS_REGION} \
+                                    --matcher HttpCode=200 \
+                                    --health-check-protocol HTTP \
+                                    --health-check-path /${params.servername}/${containerType}/settings \
+                                    --health-check-port ${containerPort} \
+                                    --health-check-interval-seconds 180 \
+                                    --health-check-timeout-seconds 120 \
+                                    --health-check-timeout-seconds 5 \
+                                    --unhealthy-threshold-count 2 \
+                                    --output text \
+                                    --query 'TargetGroups[0].TargetGroupArn'
+                            """, returnStdout: true).trim()
+
+                            echo "Target Group ARN for ${containerType}: ${targetGroupArn}"
+                            targetGroups[containerType] = targetGroupArn
+                        } else {
+                            // Retrieve the existing target group ARN
+                            def existingTargetGroupArn = sh(script: """
+                                aws elbv2 describe-target-groups \
+                                    --names ${targetGroupName} \
+                                    --region ${AWS_REGION} \
+                                    --query 'TargetGroups[0].TargetGroupArn' \
+                                    --output text
+                            """, returnStdout: true).trim()
+
+                            echo "Target group already exists for ${containerType}. Using existing Target Group ARN: ${existingTargetGroupArn}"
+                            targetGroups[containerType] = existingTargetGroupArn
+                            
+                        }
+
+                        // Retrieve all rules for the listener
+                        def allRules = sh(script: """
+                            aws elbv2 describe-rules \
+                                --listener-arn ${listenerArn} \
+                                --region ${AWS_REGION} \
+                                --query 'Rules'
+                        """, returnStdout: true).trim()
+
+                        // Check if a rule with the specified conditions already exists
+                        def ruleExists = allRules.contains("/${params.servername}/${containerType}*")
+                        
+                        
+                        // Create the rule if it doesn't exist
+                        if (!ruleExists) {
+                            def targetGroupArn = targetGroups[containerType]
+                            sh """
+                                aws elbv2 create-rule \
+                                    --listener-arn ${listenerArn} \
+                                    --conditions Field=path-pattern,Values=/${params.servername}/${containerType}* \
+                                    --priority ${newPriority} \
+                                    --actions Type=forward,TargetGroupArn=${targetGroupArn} \
+                                    --region ${AWS_REGION}
+                            """
+                            newPriority++ 
+                        } else {
+                            echo "Rule conditions already exist for ${containerType}. Skipping rule creation."
+                            newPriority++ 
+                        }
+                    }
+                    def ecsServiceName = "${params.servername}-service"
+                    def containerPortAdmin = "${env.CONTAINER_PORT_ADMIN}"
+                    def containerPortCentral = "${env.CONTAINER_PORT_CENTRAL}"
+                    def containerPortWS = "${env.CONTAINER_PORT_WS}"
+                    // Check if the Service Exists, if Not Create Service. If Yes, Delete and Create Service.
+                    def serviceExists = sh(script: """
+                        aws ecs describe-services --cluster ${ECS_CLUSTER_NAME} --services ${ecsServiceName} --region ${AWS_REGION} --query 'services[0].status' --output text
+                    """, returnStdout: true).trim()
+                    //def updateServiceResult
+                    
+                    if ("${params.centralVersion}" != 'NONE') {
+                        try {
+                            sh """
+                                aws ecs create-service \
+                                    --region ${AWS_REGION} \
+                                    --cluster ${ECS_CLUSTER_NAME} \
+                                    --service-name ${ecsServiceName} \
+                                    --task-definition ${TASKFAMILY} \
+                                    --desired-count 1 \
+                                    --launch-type FARGATE \
+                                    --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_ID}],securityGroups=[${SECURITY_GROUP_ECS}]}" \
+                                    --enable-execute-command \
+                                    --load-balancers "targetGroupArn=${targetGroups['central']},containerName=${params.servername}-central,containerPort=${containerPortCentral}" "targetGroupArn=${targetGroups['ws']},containerName=${params.servername}-ws,containerPort=${containerPortWS}" "targetGroupArn=${targetGroups['admin']},containerName=${params.servername}-admin,containerPort=${containerPortAdmin}"
+                            """
+                        } catch (Exception e) {
+                            handleError("Failed to create service: ${e.message}")
+                        }
+                    }
+                    else {
+                        try {
+                            sh """
+                                aws ecs create-service \
+                                    --region ${AWS_REGION} \
+                                    --cluster ${ECS_CLUSTER_NAME} \
+                                    --service-name ${ecsServiceName} \
+                                    --task-definition ${TASKFAMILY} \
+                                    --desired-count 1 \
+                                    --launch-type FARGATE \
+                                    --network-configuration "awsvpcConfiguration={subnets=[${PRIVATE_SUBNET_ID}],securityGroups=[${SECURITY_GROUP_ECS}]}" \
+                                    --enable-execute-command \
+                                    --load-balancers "targetGroupArn=${targetGroups['ws']},containerName=${params.servername}-ws,containerPort=${containerPortWS}" "targetGroupArn=${targetGroups['admin']},containerName=${params.servername}-admin,containerPort=${containerPortAdmin}"
+                            """
+                        } catch (Exception e) {
+                            handleError("Failed to create service: ${e.message}")
+                        }
+                    }         
+                }
+            }
+        }
+
+        stage('Delay After Deployment') {
+            steps {
+                script {
+                    echo "Delaying for 2 minutes..."
+                    sleep(time: 2, unit: 'MINUTES')
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            script {
+                slackSend channel: '#backend-releases',
+                        color: '#73c990',
+                        message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" 
+                            
+               
+            }
+        }
+        
+        failure {
+            slackSend channel: '#backend-releases',
+                    color: '#d54c53',
+                    message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+        }
+    }
+    
+    
+}
