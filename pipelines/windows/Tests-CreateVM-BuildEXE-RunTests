@@ -1,0 +1,344 @@
+pipeline {
+    agent {
+        label 'web-ui'
+    }
+
+    environment {
+        DIRECTORY = 'UI_TEST'
+         NODE = ''
+    }
+
+    parameters {
+        choice(
+            choices: ['UITests-FrontendApp-QABackendServers', 'UITests-FrontendApp-LocalBackendInstaller'],
+            description: 'Select the test pipeline',
+            name: 'UI_TEST_PIPELINE'
+        )
+
+        choice(  
+            name: 'selectserver',
+            choices: ['qa1', 'qa2','qa3', 'qa4','qa5'],
+            description: "Server to make changes\n"+
+                         "Applicable in future, Currently not needed"
+        )
+
+        string(
+            defaultValue: 'release/1.1.10',
+            description: 'Enter the name of the Git WEB_UI_BRANCH to build',
+            name: 'WEB_UI_BRANCH'
+        )
+        
+        string(
+            defaultValue: 'master',
+            description: 'Enter the name of the Git INSTALLER_BRANCH to build',
+            name: 'INSTALLER_BRANCH'
+        )
+
+        string(
+            defaultValue: 'master',
+            description: 'Enter the name of the Git WEB_UI_TEST_BRANCH to build',
+            name: 'WEB_UI_TEST_BRANCH'
+        )
+
+        choice(
+            choices: ['YES', 'NO'],
+            description: 'DELETE THE VM AFTER THE UI_TEST',
+            name: 'DELETE_VM'
+        )
+
+    }
+
+
+    stages{
+
+        stage('Display Selected Paramters') {
+            steps {
+                script {
+                    // Set VM name based on the selected pipeline
+                    if (params.UI_TEST_PIPELINE == 'UITests-FrontendApp-QABackendServers') {
+                        env.VM_NAME = 'ui-tests-01-vm'
+                        NODE = 'Cucumber'
+                    } else if (params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller') {
+                        env.VM_NAME = 'ui-tests-02-vm'
+                        NODE = 'AZURE'
+                    }
+                    echo "Selected VM Name: ${env.VM_NAME}"
+                    echo "Selected Node Name: ${NODE}"
+                    env.WEB_UI_BRANCH = params.WEB_UI_BRANCH 
+                    echo "Selected WEB_UI_BRANCH: ${env.WEB_UI_BRANCH}"
+                    env.INSTALLER_BRANCH = params.INSTALLER_BRANCH
+                    echo "Selected INSTALLER_BRANCH: ${env.INSTALLER_BRANCH}"
+                    env.WEB_UI_TEST_BRANCH = params.WEB_UI_TEST_BRANCH
+                    echo "Selected WEB_UI_TEST_BRANCH: ${env.WEB_UI_TEST_BRANCH}"
+                }
+            }
+        }
+
+        stage('Delete-VM-IF-EXIST') {
+            steps {
+                script {
+                    withCredentials([azureServicePrincipal(credentialsId: 't6-acr-service-principal2', tenantIdVariable: 'AZURE_TENANT_ID', clientIdVariable: 'AZURE_CLIENT_ID', clientSecretVariable: 'AZURE_CLIENT_SECRET')]) {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+                        def vmExists = sh(script: "az vm show -n ${env.VM_NAME} -g Development_DevOps --query 'name'", returnStatus: true)
+                        if (vmExists == 0) {
+                            echo "VM ${env.VM_NAME} exists. Deleting..."
+                            sh "az vm delete --resource-group Development_DevOps --name ${env.VM_NAME} --yes"
+                        } else {
+                            echo "VM ${env.VM_NAME} not found"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('VM Operations ') {
+            steps {
+                script {
+                    // Azure Login for all operations
+                    withCredentials([azureServicePrincipal(credentialsId: 't6-acr-service-principal2', tenantIdVariable: 'AZURE_TENANT_ID', clientIdVariable: 'AZURE_CLIENT_ID', clientSecretVariable: 'AZURE_CLIENT_SECRET')]) {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+
+                        // VM Build
+                        withCredentials([usernamePassword(credentialsId: 'ui-test-vm', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                            dir("$DIRECTORY") {
+                                sh "az vm create --resource-group Development_DevOps --name ${env.VM_NAME} --location 'East US' --image '/subscriptions/413ec3e0-3fe4-46f2-835e-474152b436ea/resourceGroups/Development_DevOps/providers/Microsoft.Compute/galleries/Base_VMs/images/UI_Integration_Testing_BaseVM/versions/1.2.3' --subnet '/subscriptions/413ec3e0-3fe4-46f2-835e-474152b436ea/resourceGroups/T6EastNetARM/providers/Microsoft.Network/virtualNetworks/T6EastNetARM/subnets/Development' --public-ip-address '' --admin-username $USERNAME --admin-password $PASSWORD --os-disk-name ${env.VM_NAME}OSDisk --os-disk-size-gb 128 --size Standard_D16s_v3 --license-type Windows_Server --os-disk-delete-option delete --nic-delete-option delete --nsg ${env.VM_NAME}NSG"
+                                
+                                def maxRetries = 30
+                                def retryInterval = 20
+                                def vmIsRunning = false
+                                for (int i = 0; i < maxRetries; i++) {
+                                    def instanceViewJson = sh(script: "az vm get-instance-view --resource-group Development_DevOps --name ${env.VM_NAME}", returnStdout: true).trim()
+                                    if (instanceViewJson.contains('VM running')) {
+                                        echo 'VM is running!'
+                                        vmIsRunning = true
+                                        break
+                                    } else {
+                                        echo "VM is not running yet. Retrying in ${retryInterval} seconds..."
+                                        sleep(retryInterval)
+                                    }
+                                }
+                                if (!vmIsRunning) {
+                                    error 'VM did not become running within the specified time.'
+                                }
+                            }
+                        }
+
+                        // Update jenkins-user-js password
+                        withCredentials([usernamePassword(credentialsId: 'ui-test-vm-js', usernameVariable: 'VM_USERNAME', passwordVariable: 'VM_PASSWORD')]) {
+                            sh "az vm user update --resource-group Development_DevOps --name ${env.VM_NAME} --username $VM_USERNAME --password $VM_PASSWORD"
+                        }
+
+                        // Stop and Start VM
+                        sh "az vm deallocate --resource-group Development_DevOps --name ${env.VM_NAME}"
+                        def maxRetriesStop = 30
+                        def retryIntervalStop = 20
+                        for (int i = 0; i < maxRetriesStop; i++) {
+                            def instanceViewJsonStop = sh(script: "az vm get-instance-view --resource-group Development_DevOps --name ${env.VM_NAME}", returnStdout: true).trim()
+                            if (instanceViewJsonStop.contains('VM deallocated')) {
+                                echo 'VM has been deallocated!'
+                                break
+                            } else {
+                                echo "VM is not deallocated yet. Retrying in ${retryIntervalStop} seconds..."
+                                sleep(retryIntervalStop)
+                            }
+                        }
+                        sh "az vm start --resource-group Development_DevOps --name ${env.VM_NAME}"
+                        def maxRetriesStart = 30
+                        def retryIntervalStart = 20
+                        for (int i = 0; i < maxRetriesStart; i++) {
+                            def instanceViewJsonStart = sh(script: "az vm get-instance-view --resource-group Development_DevOps --name ${env.VM_NAME}", returnStdout: true).trim()
+                            if (instanceViewJsonStart.contains('VM running')) {
+                                echo 'VM is running!'
+                                break
+                            } else {
+                                echo "VM is not running yet. Retrying in ${retryIntervalStart} seconds..."
+                                sleep(retryIntervalStart)
+                            }
+                        }
+
+                        // Updating Task Scheduler
+                        def jenkinsArguments = ''
+                        if (params.UI_TEST_PIPELINE == 'UITests-FrontendApp-QABackendServers') {
+                            jenkinsArguments = '-jar agent.jar -jnlpUrl https://jenkins.t6cloud.com/computer/Cucumber/jenkins-agent.jnlp -secret a53f9c4a05bb5cfe2f27fc317129b429981469516f75e79ed1f877bde6ef2863 -workDir C:\\\\tools\\\\jenkins-agent'
+                        } else if (params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller') {
+                            jenkinsArguments = '-jar agent.jar -jnlpUrl https://jenkins.t6cloud.com/computer/AZURE/jenkins-agent.jnlp -secret 720b724f2b48c4c94637c64e96d0cec15c77d9a871c799f20b8b749b8bc4c77a -workDir C:\\\\tools\\\\jenkins-agent'
+                        }
+                        // Set the Jenkins agent name
+                        sh """
+                        az vm run-command invoke --resource-group Development_DevOps --name ${env.VM_NAME} --command-id RunPowerShellScript \
+                        --scripts "Set-ScheduledTask -TaskName 'Start Jenkins agent' -TaskPath '\\' -Action (New-ScheduledTaskAction -Execute 'java.exe' -Argument '${jenkinsArguments}' -WorkingDirectory 'C:\\\\tools\\\\jenkins-agent')"
+                        """
+                        // Disable validation of certificates for RDP client - so we can RDP to localhost
+                        sh """
+                        az vm run-command invoke --resource-group Development_DevOps --name ${env.VM_NAME} --command-id RunPowerShellScript \
+                        --scripts "New-ItemProperty -Path 'HKLM:\\\\SOFTWARE\\\\Microsoft\\\\Terminal Server Client\\' -Name 'AuthenticationLevelOverride' -Value 0 -PropertyType DWord"
+                        """
+                        // Disable "Choose privacy settings" screen on logon
+                        sh """
+                        az vm run-command invoke --resource-group Development_DevOps --name ${env.VM_NAME} --command-id RunPowerShellScript \
+                        --scripts "\\\$RegistryPath = 'HKLM:\\\\SOFTWARE\\\\Policies\\\\Microsoft\\\\Windows\\\\OOBE'; New-Item -Path \\\$RegistryPath -Force; New-ItemProperty -Path \\\$RegistryPath -Name 'DisablePrivacyExperience' -Value 1 -PropertyType DWord"
+                        """
+
+                        // Start Docker Desktop on logon
+                        sh """
+                        az vm run-command invoke \
+                        --resource-group Development_DevOps \
+                        --name ${env.VM_NAME} \
+                        --command-id RunPowerShellScript \
+                        --scripts "\\\$action = New-ScheduledTaskAction -Execute 'C:\\\\Program Files\\\\Docker\\\\Docker\\\\Docker Desktop.exe'; \\\$trigger = New-ScheduledTaskTrigger -AtLogOn -User 'jenkins-user'; \\\$principal = New-ScheduledTaskPrincipal -UserId 'jenkins-user' -LogonType Interactive; Register-ScheduledTask -Action \\\$action -Trigger \\\$trigger -TaskName 'StartDockerDesktopOnLogon' -Description 'Starts Docker Desktop when jenkins-user logs in' -Principal \\\$principal"
+                        """
+
+                        // Open Firewall for Docker Desktop Backend
+                        sh """
+                        az vm run-command invoke --resource-group Development_DevOps --name ${env.VM_NAME} --command-id RunPowerShellScript \
+                        --scripts "New-NetFirewallRule -DisplayName 'Docker Desktop Backend' -Direction Inbound -Program 'C:\\Program Files\\Docker\\Docker\\resources\\com.docker.backend.exe' -Action Allow"
+                        """
+                        
+                        // Retrieve Docker registry credentials
+                        withCredentials([usernamePassword(credentialsId: 'DockerRegistry', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                            // Correctly escape and format the PowerShell script for Docker login after Docker Desktop starts
+                            sh """
+                            az vm run-command invoke \
+                            --resource-group Development_DevOps \
+                            --name ${env.VM_NAME} \
+                            --command-id RunPowerShellScript \
+                            --scripts "\\\$action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument '-NoProfile -WindowStyle Hidden -Command \\"Start-Sleep -Seconds 120; docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD t6acr.azurecr.io\\"'; \\\$trigger = New-ScheduledTaskTrigger -AtLogOn -User 'jenkins-user'; \\\$principal = New-ScheduledTaskPrincipal -UserId 'jenkins-user' -LogonType Interactive; Register-ScheduledTask -Action \\\$action -Trigger \\\$trigger -TaskName 'DockerLoginAfterStart' -Description 'Logs into Docker after Docker Desktop starts' -Principal \\\$principal"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        stage('RDP Connection and File Downloads') {
+            steps {
+                script {
+                    withCredentials([
+                        azureServicePrincipal(credentialsId: 't6-acr-service-principal2', tenantIdVariable: 'AZURE_TENANT_ID', clientIdVariable: 'AZURE_CLIENT_ID', clientSecretVariable: 'AZURE_CLIENT_SECRET'),
+                        usernamePassword(credentialsId: 'ui-test-vm-js', usernameVariable: 'VM_USERNAME', passwordVariable: 'VM_PASSWORD')
+                    ]) {
+                        // Log into Azure
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+
+                        // Get the private IP address of the VM
+                        def privateIp = sh(script: "az vm show --resource-group Development_DevOps --name ${env.VM_NAME} --query privateIps -d --output tsv", returnStdout: true).trim()
+                        if (privateIp) {
+                            // Use withEnv to securely pass the VM_PASSWORD to the RDP command
+                            withEnv(["RDP_PASSWORD=$VM_PASSWORD"]) {
+                                // Execute RDP command with a timeout of 20 seconds and capture output
+                                def rdpOutput = ""
+                                try {
+                                    rdpOutput = sh(script: "timeout 20 xvfb-run -a --server-args='-screen 0 1920x1080x24' xfreerdp /v:$privateIp /u:$VM_USERNAME /p:$RDP_PASSWORD /cert-ignore /f", returnStdout: true).trim()
+                                    echo "RDP Connection Status: $rdpOutput"
+                                } catch (Exception e) {
+                                    // Catch the exception to prevent the stage from failing
+                                    echo "RDP connection was aborted or failed: ${e.getMessage()}"
+                                }
+                            }
+
+                            
+
+                            sh """
+                            az vm run-command invoke --resource-group Development_DevOps --name ${env.VM_NAME} --command-id RunPowerShellScript \
+                            --scripts "New-Item -Path 'C:\\tools\\mirth' -ItemType Directory -Force; Invoke-WebRequest -Uri 'https://nexus.t6cloud.com/repository/t6hs-windows/Artifacts%2Fmirth%2FWindows%2F4.3.0%2FWindows-4.3.0.zip' -OutFile 'C:\\tools\\mirth\\Windows-4.3.0.zip'; Expand-Archive -LiteralPath 'C:\\tools\\mirth\\Windows-4.3.0.zip' -DestinationPath 'C:\\tools\\mirth' -Force; Remove-Item -Path 'C:\\tools\\mirth\\Windows-4.3.0.zip' -Force"
+                            """
+                            echo "Mirth file downloaded, extracted, and zip file removed from VM in the C:\\tools\\mirth folder."
+
+
+                            // Sleep for 120 seconds
+                            sleep time: 120, unit: 'SECONDS'
+
+                        } else {
+                            echo "Failed to retrieve the private IP address."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build-Frontend-App-EXE') {
+            steps {
+                script {
+
+                    def job = build job: 'Build-Frontend-App-EXE', parameters: [
+                        string(name: 'public_url_prefix', value: params.public_url_prefix ?: 'installer/njua2svzb'),
+                        string(name: 'WEB_UI_BRANCH', value: env.WEB_UI_BRANCH),
+                        string(name: 'MODE', value: params.MODE ?: 'production'),
+                        string(name: 'NEXUS_ONLY', value: 'true')
+                    ], wait: true
+                    def vars = job.getBuildVariables()
+                    env.NEXUS_URL_STRING = vars.NEXUS_URL_STRING
+                    echo "URL: ${vars.NEXUS_URL_STRING}"
+
+                    
+                }
+            }
+        }
+
+        stage('Download-Frontend-APP') {
+            agent { node NODE }
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        
+                        bat "curl -sS -L ${env.NEXUS_URL_STRING} -o t6-frontend.exe -k"
+                    }
+                }
+            }
+        }
+
+        stage('Build-Backend-Installer-EXE') {
+            steps {
+                script {
+
+                    def job = build job: 'Build-Backend-Installer-EXE', parameters: [
+                        string(name: 'public_url_prefix', value: params.public_url_prefix ?: 'installer/me4kzytqz'),
+                        string(name: 'INSTALLER_BRANCH', value: env.INSTALLER_BRANCH),
+                        string(name: 'NEXUS_ONLY', value: 'true')
+                    ], wait: true
+                    def vars = job.getBuildVariables()
+                    env.INSTALLER_NEXUS_URL_STRING = vars.INSTALLER_NEXUS_URL_STRING
+                    echo "URL: ${vars.INSTALLER_NEXUS_URL_STRING}"
+
+                    
+                }
+            }
+        }
+
+        stage('Download-Backend-Installer') {
+            agent { node NODE }
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        
+                        bat "curl -sS -L ${env.INSTALLER_NEXUS_URL_STRING} -o t6-admin.exe -k"
+                    }
+                }
+            }
+        }
+
+        stage('Trigger UI-Tests-Executor') {
+            steps {
+                script {
+                    def job = build job: 'UI-Tests-Executor', parameters: [
+                        string(name: 'WEB_UI_TEST_BRANCH', value: env.WEB_UI_TEST_BRANCH),
+                        string(name: 'UI_TEST_PIPELINE', value: params.UI_TEST_PIPELINE),
+                    ], wait: true
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if (params.DELETE_VM == 'YES') {
+                    echo "Triggering VM deletion job for VM '${env.VM_NAME}'"
+                    build job: 'UI-Test-DeleteVM', parameters: [string(name: 'VM_NAME', value: "${env.VM_NAME}")], wait: false
+                } else {
+                    echo "VM Deletion skipped as per user choice. The VM '${env.VM_NAME}' will be retained"
+                }
+            }
+        }
+        
+        
+    }
+}
