@@ -1,0 +1,149 @@
+#!groovy
+
+@Library(['getChanges']) _
+
+pipeline {
+
+    agent { label 'web-ui' }
+
+    environment {
+        DIRECTORY = 't6-web-ui-frontend'
+        AUTHOR = ''
+        
+    }
+     parameters {
+        
+        string(name: 'BRANCH', defaultValue: 'develop', description: 'Enter the name of the Git branch to build')
+        
+    }
+
+
+    options {
+        checkoutToSubdirectory('t6-web-ui-frontend')
+        ansiColor('xterm')
+        timestamps()
+        
+    }
+
+    stages {
+
+        stage('Checkout Branch') {
+            steps {
+                script {
+                    if (BRANCH != '*/develop') {
+                        println "Checking-out Branch: [${BRANCH}]"
+                        checkout([
+                            $class: 'GitSCM', 
+                            branches: [[name: "${BRANCH}"]],
+                            doGenerateSubmoduleConfigurations: false, 
+                            extensions: [
+                                [$class: 'CleanCheckout'], 
+                                [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"],
+                                [$class: 'CloneOption', timeout: 40]  // Here we set the timeout to 20 minutes
+                            ], 
+                            submoduleCfg: [], 
+                            userRemoteConfigs: [[
+                                credentialsId: 'Jenkins-Gitlab-Service-Account', 
+                                url: 'git@giturl:T6/web-ui.git'
+                            ]]
+                        ])
+                    }
+                }
+            }
+        }
+
+
+        stage('Start Start Build Notification') {
+            steps {
+                slackSend channel: '#frontend-release',
+                        color: '#4a6785',
+                        message: "STARTING: Pipeline ${currentBuild.fullDisplayName} \n" +
+                                "The selected branch is ${BRANCH}"
+            }
+        }
+
+
+
+        stage('Configure Git') {
+            steps {
+                dir("$DIRECTORY") {
+                    sh 'git config --global user.email "jenkins@t6hs.com"'
+                    sh 'git config --global user.name "Jenkins"'                    
+                }
+            }
+        }
+
+        
+        stage('Install Dependencies and build') {
+            steps {
+                dir("$DIRECTORY") {
+                    sh "GIT_SSH_COMMAND='ssh -i ~/.ssh/web-ui-agent-gitlab-key' npm install --prefix ./frontend --prefer-offline"
+                    sh "npm run build --prefix ./frontend"
+                }
+            }
+        }
+
+        stage('Read Package Version') {
+            steps {
+                dir("$DIRECTORY/frontend") {
+                    script {
+                        PACKAGE_VERSION = sh(script: "node -p \"require('./package.json').version\"", returnStdout: true).trim()
+                    }
+                }
+            }
+        }
+        stage('Modify Branch Name') {
+            steps {
+                script {
+                    // Replace '/' with '-' if BRANCH is not null and contains '/'
+                    MODIFIED_BRANCH = BRANCH?.replace('/', '-') ?: BRANCH
+                }
+            }
+        }
+
+
+        stage('Generating Docker Image for Production') {
+            steps {
+                script {
+                    dir("$DIRECTORY") {
+                        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+
+                            sh "az acr build . --registry t6Acr --image t6-web-ui-frontend:${PACKAGE_VERSION.toLowerCase()}-${MODIFIED_BRANCH}-${env.BUILD_NUMBER}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Display Docker Image ') {
+            steps {
+                script {
+                    dir("$DIRECTORY") {
+                        def dockerimage = "t6-web-ui-frontend:${PACKAGE_VERSION.toLowerCase()}-${MODIFIED_BRANCH}-${env.BUILD_NUMBER}"
+                        env.DOCKER_IMAGE = dockerimage
+                        echo "Docker Image: ${dockerimage}"
+                    }
+                }
+            }
+        }
+
+    }
+    post {
+        success {
+             slackSend channel: '#frontend-release',
+                        color: '#73c990',
+                        message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed T6-web-ui with the seleted ${BRANCH} :\n" +
+                            "Successfully created a Docker image with the name t6-web-ui-frontend:${PACKAGE_VERSION.toLowerCase()}-${BRANCH}-${env.BUILD_NUMBER}.\n" 
+                            
+        }
+
+        failure {
+            slackSend channel: '#frontend-release',
+                color: '#d54c53',
+                message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+        }
+    }
+}
