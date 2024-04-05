@@ -1,0 +1,305 @@
+#!groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def wsVersions = ['n/a']
+def adminVersions = ['n/a']
+def integrationVersions = ['n/a']
+def dbtoolsVersions = ['n/a']
+def nexusUrl = "https://nexus/"
+def queryUrl = "${nexusUrl}/service/rest/v1/search?repository=t6hs-releases&group=com.t6hs&name="
+def t6RepoUrl = "${nexusUrl}/repository/t6hs-releases"
+
+
+
+def choiceArray = []
+
+@Library(['sortVersions', 'getNexusArtifactVersions']) _
+
+node('Agent7-prod-MWE') {
+    script {
+        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+            sh script: 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+
+            def webserviceTags = sh script: 'az acr repository show-tags -n t6Acr --orderby time_desc --repository t6-webservice', returnStdout: true
+            wsVersions = new JsonSlurperClassic().parseText(webserviceTags)
+
+            def adminTags = sh script: 'az acr repository show-tags -n t6Acr --orderby time_desc --repository t6-admin', returnStdout: true
+            adminVersions = new JsonSlurperClassic().parseText(adminTags)
+
+        }
+
+        
+
+        def dbtoolsVer = getNexusArtifactVersions("${queryUrl}t6-dbtools")
+        dbtoolsVersions = dbtoolsVer.sort().reverse()
+
+        checkout scm
+        def folders = sh(returnStdout: true, script: "ls ./configset/") 
+        folders.split().each {
+            choiceArray << it
+        }
+    }
+}
+
+pipeline {
+    agent { label 'release-mwe-prod' }
+    parameters {
+        choice name: 'parameterize',
+            choices: ['Yes', 'No'],
+            description: "Do you wish to do a dry run to grab/update parameters?\n" +
+                    " - It is recommended to run with in this mode before deploy"
+
+        choice name: 'selectserver',
+                choices: ['dev99','prod11','prod22','prod23', 'prod3'],
+                description: 'Server to make changes'
+
+        choice name: 'dbtoolsVersion',
+            choices: dbtoolsVersions,
+            description: 'DBtool-version'
+
+        choice name: 'wsVersion',
+            choices: wsVersions,
+            description: 'T6 Webservice version'
+
+        choice name: 'adminVersion',
+            choices: adminVersions,
+            description: 'T6 Admin version'
+
+
+        text name: 'userComments',
+            defaultValue: '',
+            description: 'Provide the purpose of the build and metadata version used'
+    }
+    environment {
+        WS_VERSION = "${params.wsVersion}"
+        ADMIN_VERSION = "${params.adminVersion}"
+        server = "${params.selectserver}"
+        DBTOOLS_VERSION = "${params.dbtoolsVersion}"
+        NEXUS_URL = 'https://nexus.t6cloud.com'
+        
+     }
+    
+    options {
+        checkoutToSubdirectory "docker-provisioning"
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage("Parameterizing Job") {
+        
+            steps {
+                script {
+                    if ("${params.parameterize}" == "Yes") {
+                        currentBuild.result = 'ABORTED'
+                        error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+                    }
+                }
+            }
+        }
+
+        stage('Start Start Build Notification') {
+            steps {
+                slackSend channel: '#backend-releases',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+
+            }
+        }
+
+        
+        stage('Copying the Configs') {
+            steps {
+                sh "pwd"
+                sh script: "cp -r PROD-Configs/${server}/admin_params.env /opt/t6/${server}/admin_params.env"
+                sh script: "cp -r PROD-Configs/${server}/stack_params.env /opt/t6/${server}/stack_params.env"
+                sh script: "cp -r PROD-Configs/${server}/webservice_params.env /opt/t6/${server}/webservice_params.env"
+                sh script: "cp -r PROD-Configs/${server}/docker-compose.yml /opt/t6/${server}/docker-compose.yml"
+                sh script: "cp -r /opt/t6/credentials/credentials.env /opt/t6/${server}/credentials.env"
+
+            }
+        }
+
+        stage('Creating docker-compose file') {
+            steps {
+                script {
+                    dir("/opt/t6/${server}") {
+
+                        sh script: "docker-compose down"
+                        def composeFile = readFile("docker-compose.yml")
+                        // Replace the version of t6-webservice
+                        composeFile = composeFile.replaceAll("t6acr.azurecr.io/t6-webservice:.*", "t6acr.azurecr.io/t6-webservice:$WS_VERSION")
+
+                        // Replace the version of t6-admin
+                        composeFile = composeFile.replaceAll("t6acr.azurecr.io/t6-admin:.*", "t6acr.azurecr.io/t6-admin:$ADMIN_VERSION")
+                        writeFile file: "docker-compose.yml", text: composeFile
+                    }
+                }
+            }
+        }
+
+        stage('DB-Updation') {
+            steps {
+                script {
+                    withCredentials([
+                        azureServicePrincipal('t6-acr-service-principal'),
+                        usernamePassword(credentialsId: 'db-creds', usernameVariable: 'DB_USERNAME', passwordVariable: 'DB_PASSWORD')
+                    ]) {
+                        sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+
+                        println("Building db ")
+
+                        sh script: "if [ -f t6-dbtools.jar ]; then rm t6-dbtools.jar; fi"
+
+                        sh script: "curl --insecure -LJO ${NEXUS_URL}/repository/t6hs-releases/com/t6hs/t6-dbtools/${DBTOOLS_VERSION}/t6-dbtools-${DBTOOLS_VERSION}.zip"
+                        
+                        sh script: "unzip t6-dbtools-${DBTOOLS_VERSION}.zip"
+                        sh script: "cp t6-dbtools-${DBTOOLS_VERSION}/lib/t6-dbtools-${DBTOOLS_VERSION}.jar ./t6-dbtools.jar"
+                        sh script: "rm -rf t6-dbtools-${DBTOOLS_VERSION}.zip t6-dbtools-${DBTOOLS_VERSION}"
+
+                        // Deleting old jar in the db-tools
+                        sh script: "rm -rf /opt/t6/${server}/dbtools/lib/t6-dbtools.jar"
+
+                        // Copying new jar to the db-tools
+                        sh script: "cp ./t6-dbtools.jar /opt/t6/${server}/dbtools/lib/"
+
+                        // Running database operations under the specific directory
+                        dir("/opt/t6/${server}/dbtools") {
+                            
+                            sh script: "java -jar ./lib/t6-dbtools.jar -a username-password -d ${server} -m in -F -M ad-JOMIS-DEV -H t6esql2.t6cloud.com -U $DB_USERNAME -pw $DB_PASSWORD"
+                        }
+                    }
+                }
+            }
+        }
+        stage('App build') {
+            steps {
+                script {
+                    dir("/opt/t6/${server}") {
+                        withCredentials([azureServicePrincipal('t6-acr-service-principal')]) {
+                            sh 'az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID'
+                            sh 'az acr login -n t6acr'
+                            sh script: "docker-compose up --build -d --remove-orphans"
+                        }
+
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+
+        success {
+            script {
+                slackSend channel: '#backend-releases',
+                    color: '#73c990',
+                    message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed and the  ${server} is updated the with the below parameters:\n" +
+                            "WS_VERSION = ${WS_VERSION}\n" +
+                            "ADMIN_VERSION = ${ADMIN_VERSION}\n" 
+                withCredentials([usernamePassword(credentialsId: 'confluenceCredentials', passwordVariable: 'CONFLUENCE_TOKEN', usernameVariable: 'CONFLUENCE_USERNAME')]) {
+
+                    def authString = "${CONFLUENCE_USERNAME}:${CONFLUENCE_TOKEN}".bytes.encodeBase64().toString()
+                    def baseURL = 'https://t6health.atlassian.net/wiki/rest/api/content'
+
+                    // Search for an existing child page
+                    def pageSearchURL = baseURL + '?spaceKey=TDS&title=' + URLEncoder.encode(params.selectserver, "UTF-8")
+                    def pageSearchResponse = httpRequest(
+                        httpMode: 'GET',
+                        url: pageSearchURL,
+                        contentType: 'APPLICATION_JSON',
+                        customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]]
+                    )
+                    def jsonResponse = readJSON text: pageSearchResponse.content
+                    def existingPageId = (jsonResponse && jsonResponse.results && !jsonResponse.results.isEmpty()) ? jsonResponse.results[0].id : null
+
+                    // Delete the existing page if it exists
+                    if (existingPageId) {
+                        def deleteURL = baseURL + '/' + existingPageId
+                        httpRequest(
+                            httpMode: 'DELETE',
+                            url: deleteURL,
+                            contentType: 'APPLICATION_JSON',
+                            customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]]
+                        )
+                    }
+
+                    // Create a new child page
+                    def buildTimestamp = new Date(currentBuild.startTimeInMillis)
+                    def buildTime = buildTimestamp.format('yyyy-MM-dd HH:mm', TimeZone.getTimeZone('America/Toronto'))
+
+                    def parentPageId = '15368193'
+                    def newPageContent = """*
+                            <table>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Value</th>
+                                </tr>
+                                <tr>
+                                    <td>WEBSERVICE_VERSION</td>
+                                    <td>${params.wsVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>ADMIN_VERSION</td>
+                                    <td>${params.adminVersion}</td>
+                                </tr>
+                                <tr>
+                                    <td>Jenkins URL</td>
+                                    <td><a href="${env.BUILD_URL}">Jenkins</a></td>
+                                </tr>
+                                <tr>
+                                    <td>buildTime</td>
+                                    <td>${buildTime}</td>
+                                </tr>
+                                <tr>
+                                    <td>Description</td>
+                                    <td>${params.userComments}</td>
+                                </tr>
+                                <tr>
+                                    <td>Admin URL</td>
+                                    <td>https://dev.t6cloud.com/${server}/admin/</td>
+                                </tr>
+                                <tr>
+                                    <td>Webservice URL</td>
+                                    <td>https://dev.t6cloud.com/${server}/ws/settings/</td>
+                                </tr>
+                            </table>
+                        """
+
+
+                    def newPagePayload = [
+                        type: 'page',
+                        title: params.selectserver,
+                        space: [key: 'TDS'],
+                        ancestors: [ [id: parentPageId] ],
+                        body: [ storage: [value: newPageContent, representation: 'storage'] ]
+                    ]
+
+                    httpRequest(
+                        httpMode: 'POST',
+                        url: baseURL,
+                        contentType: 'APPLICATION_JSON',
+                        customHeaders: [[name: 'Authorization', value: "Basic ${authString}"]],
+                        requestBody: writeJSON(returnText: true, json: newPagePayload)
+                    )
+                }
+            }            
+        }
+
+        failure {
+            slackSend channel: '#backend-releases',
+                color: '#d54c53',
+                message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+}
+      
+    
