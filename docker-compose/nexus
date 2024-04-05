@@ -1,0 +1,16 @@
+version: "3"
+services:
+    nexus:
+        image: sonatype/nexus3:latest
+        restart: always
+        volumes:
+            - "./nexus-data:/nexus-data"
+        ports:
+            - "8081:8081"
+        networks:
+           - Nexus-Network
+
+networks:
+    Nexus-Network:
+        external: true
+        name: Devops-Tool
