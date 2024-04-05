@@ -1,0 +1,384 @@
+pipeline {
+    agent { label 'web-ui' }
+    parameters {
+        string(
+            defaultValue: 'value',
+            description: 'Enter the public URL prefix',
+            name: 'public_url_prefix'
+        )
+        string(
+            defaultValue: 'master',
+            description: 'Enter the name of the Git INSTALLER_BRANCH to build',
+            name: 'INSTALLER_BRANCH'
+        )
+        choice(name: 'NEXUS_ONLY', choices: ['false', 'true'], description: 'Only select true for E2E Test, else keep it as false')
+        choice(name: 'SIGN_EXE', choices: ['true', 'false'], description: 'Choose boolean value')
+    }
+
+    environment {
+        
+        DIRECTORY = 'T6-Admin-EXE'
+        PUBLIC_URL_PREFIX = "${params.public_url_prefix}"
+        URL_STATUS = 'NOT_FOUND' // Default value
+        
+    }
+
+    stages {
+        stage('Display BRANCH SELECTED') {
+            steps {
+                script {
+
+                    env.INSTALLER_BRANCH = params.INSTALLER_BRANCH
+                    echo "Selected INSTALLER_BRANCH: ${env.INSTALLER_BRANCH}"
+
+                }
+            }
+        }
+        stage('Construct Nexus URL') {
+            
+            when {
+                
+                expression { params.NEXUS_ONLY == 'true' }
+            }
+            steps {
+                script {
+                    // Initialize and set variables
+                    def version = (params.INSTALLER_BRANCH ==~ /release\/\d+\.\d+\.\d+/) ? params.INSTALLER_BRANCH.tokenize('/')[1] : 'dev'
+                    def COMMIT_HASH = ''
+
+                    sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                        COMMIT_HASH = sh(
+                            script: "git ls-remote git@git.net.venuiti.com:T6/server-installer.git ${params.INSTALLER_BRANCH} | cut -f1",
+                            returnStdout: true
+                        ).trim()[0..6]
+                    }
+
+                    // Construct Nexus URL
+                    def nexusUrl = "https://nexusurl/repository/t6hs-releases/com/t6hs/t6-server-installer/${params.INSTALLER_BRANCH}/TAC_Server_Setup_dev_${COMMIT_HASH}.exe"
+                    println "Nexus URL: ${nexusUrl}"
+
+                    // Check URL status and set the global variable
+                    try {
+                        def url = new URL(nexusUrl)
+                        def connection = url.openConnection()
+                        connection.requestMethod = 'GET'
+                        connection.connect()
+                        def responseCode = connection.responseCode
+                        if (responseCode == 200) {
+                            println "URL Status: OK"
+                            URL_STATUS = 'OK'
+                            env.INSTALLER_NEXUS_URL_STRING = "https://nexusurl/repository/t6hs-releases/com/t6hs/t6-server-installer/${params.INSTALLER_BRANCH}/TAC_Server_Setup_dev_${COMMIT_HASH}.exe"
+                            println "INSTALLER_NEXUS_URL_STRING: ${env.INSTALLER_NEXUS_URL_STRING}"
+                        } else {
+                            println "URL Status: Not Found"
+                        }
+                    } catch (Exception e) {
+                        println "Error checking URL: ${e.message}"
+                    }
+                }
+            }
+        }
+
+        stage('Start Arm64 VM') {
+            when {
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            steps {
+                withCredentials([azureServicePrincipal('t6-acr-service-principal2')]) {
+                    script {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+                        sh "az vm start --resource-group Development_DevOps --name electron-arm64"
+                    }
+                }
+            }
+        }
+
+
+        stage('Start Build Notification') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                slackSend channel: '#server-builds',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+
+        stage('Configure Git attributes') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                bat 'git config --global user.email "jenkins@t6hs.com"'
+                bat 'git config --global user.name "Jenkins"'
+                bat 'where ssh-agent'
+            }
+        }
+
+        stage('Checkout INSTALLER_BRANCH') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                script {
+                    if (INSTALLER_BRANCH != '*/develop') {
+                        println "Checking-out INSTALLER_BRANCH: [${INSTALLER_BRANCH}]"
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "${INSTALLER_BRANCH}"]],
+                            doGenerateSubmoduleConfigurations: false,
+                            extensions: [
+                                
+                                [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]
+                            ],
+                            submoduleCfg: [],
+                            userRemoteConfigs: [
+                                [credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@git.net.venuiti.com:T6/server-installer.git']
+                            ]
+                        ])
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Commit Hash') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        
+                        bat(returnStdout: true, script: 'git rev-parse --short HEAD > commit_hash.txt')
+                        
+                        def commitHash = readFile('commit_hash.txt').trim()
+                        COMMIT_HASH = commitHash.length() > 7 ? commitHash.substring(0, 7) : commitHash
+                       
+                        echo "Commit Hash: ${COMMIT_HASH}"
+                    }
+                }
+            }
+        }
+
+    
+        stage('Delete build folder') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                dir("${DIRECTORY}") {
+                    bat 'if exist build\\*.exe del build\\*.exe'
+                }
+            }
+        }
+
+        stage('Build NSIS exe') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                script {
+                    def signExeParam = params.SIGN_EXE
+
+                    dir("${DIRECTORY}") {
+                        withCredentials([string(credentialsId: 'T6_CodeSigning_Token_Password', variable: 'T6_CodeSigning_Token_Password'),
+                                         string(credentialsId: 'T6_CodeSigning_Token_Name', variable: 'T6_CodeSigning_Token_Name'),
+                                         file(credentialsId: 'BackendInstaller_NGINX_Cert_Key', variable: 'PATH_TO_NGINX_CERTIFICATE_KEY')]) {
+                            echo "Using Commit Hash: ${COMMIT_HASH}"
+                            if (signExeParam == 'true') {
+                                bat """
+                                    .\\Nsis\\makensis.exe /DSIGN_EXE=1 /DCERT_PASS=${T6_CodeSigning_Token_Password} /DCODE_SIGNING_CERT_TOKEN_NAME=${T6_CodeSigning_Token_Name} /DPATH_TO_NGINX_CERTIFICATE_KEY="${PATH_TO_NGINX_CERTIFICATE_KEY}" Installer.nsi
+                                    .\\Nsis\\makensis.exe /DSIGN_EXE=1 /DCERT_PASS=${T6_CodeSigning_Token_Password} /DCODE_SIGNING_CERT_TOKEN_NAME=${T6_CodeSigning_Token_Name} /DPATH_TO_NGINX_CERTIFICATE_KEY="${PATH_TO_NGINX_CERTIFICATE_KEY}" PatchInstaller.nsi
+                                """
+                            } else {
+                                bat """
+                                    .\\Nsis\\makensis.exe /DSIGN_EXE=0 /DPATH_TO_NGINX_CERTIFICATE_KEY="${PATH_TO_NGINX_CERTIFICATE_KEY}" Installer.nsi
+                                """
+                            }
+                        }
+                    }
+                }   
+            }
+        }
+
+        stage('Upload to Azure Storage') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                dir("${DIRECTORY}") {
+                    withCredentials([string(credentialsId: 'sasToken-ELectron', variable: 'sasToken-ELectron')]) {
+                        echo "Using Commit Hash: ${COMMIT_HASH}"
+                        bat """
+                            for %%G in (.\\Build\\*.exe) do (
+                                echo Uploading: %%~nG.${env.BUILD_NUMBER}.exe
+                                az storage blob upload --account-name t6hsfilesinstallers --container-name artifacts --name "T6_AdminExe/T6_AdminExe_BuildExe/${COMMIT_HASH}/%%~nG.${env.BUILD_NUMBER}.exe" --type block --sas-token "%sasToken-ELectron%" --file "%%G" --overwrite
+                                echo %%~nG.${env.BUILD_NUMBER}.exe
+                                echo %%~nG.${env.BUILD_NUMBER}.exe > tmp.txt
+                        )
+                        """
+                    }
+                }   
+            }
+        }
+       
+        stage('Upload to Nexus') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'Nexus',
+                            usernameVariable: 'nexusUsername',
+                            passwordVariable: 'nexusPassword'
+                        )]) {
+                            bat """
+                            for %%G in (.\\Build\\*.exe) do (
+                                echo Uploading: TAC_Server_Setup_dev_${COMMIT_HASH}.exe
+                                curl -v -u ${nexusUsername}:${nexusPassword} --upload-file "%%G" "https://nexusurl/repository/t6hs-releases/com/t6hs/t6-server-installer/${params.INSTALLER_BRANCH}/TAC_Server_Setup_dev_${COMMIT_HASH}.exe"
+                                echo TAC_Server_Setup_dev_${COMMIT_HASH}.exe uploaded
+                            )
+                            
+                            """
+                            def nexus_urlString = "https://nexusurl/repository/t6hs-releases/com/t6hs/t6-server-installer/${params.INSTALLER_BRANCH}/TAC_Server_Setup_dev_${COMMIT_HASH}.exe"
+                            env.INSTALLER_NEXUS_URL_STRING = nexus_urlString
+                            echo "Nexus URL: ${nexus_urlString}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Push Git Tag') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                script {
+                    dir("${DIRECTORY}") {
+                        // Verify if the file exists
+                        def filePath = '.\\tmp.txt'
+                        if (!fileExists(filePath)) {
+                            error("File not found: ${filePath}")
+                        }
+
+                        // Read the content of the file
+                        def fileContent = readFile(filePath).trim()
+
+                        // Subtract the version number by removing the last hyphen and the ".exe" extension
+                        def lastHyphenIndex = fileContent.lastIndexOf('-')
+                        def tagContent = fileContent.substring(lastHyphenIndex + 1, fileContent.lastIndexOf('.exe'))
+                        echo "${tagContent}"
+
+                        // Push the extracted content as a Git tag
+                        try {
+                            sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                                bat """
+                                    git config --global user.email "jenkins@t6hs.com"
+                                    git config --global user.name "Jenkins"
+                                    git tag "${tagContent}"
+                                    git push origin --tags
+                                """
+                            }
+                        } catch (Exception e) {
+                            error("Error occurred while executing Git commands: ${e.getMessage()}")
+                        }
+                    }
+                }
+            }
+        }
+        stage('Store URL') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            agent { label 'electron' }
+            
+            steps {
+                dir("${DIRECTORY}") {
+                    script {
+                        def fileName = readFile('tmp.txt').trim()
+                        def publicUrlPrefix = env.PUBLIC_URL_PREFIX
+                        def urlString = "https://t6hs.com/${publicUrlPrefix}/${COMMIT_HASH}/${fileName}"
+                        // Store the URL in a custom environment variable
+                        env.URL_STRING = urlString
+                        echo "URL: ${urlString}"
+                    }
+                }
+            }
+        }
+
+        stage('Deallocate Arm64 VM') {
+            when {
+                beforeAgent true
+                expression { URL_STATUS == 'NOT_FOUND' }
+            }
+            steps {
+                withCredentials([azureServicePrincipal('t6-acr-service-principal2')]) {
+                    script {
+                        sh "az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID"
+                        sh "az vm deallocate --resource-group Development_DevOps --name electron-arm64"
+                    }
+                }
+            }
+        }
+
+    }
+    post {
+        success {
+            script {
+                if (URL_STATUS == 'NOT_FOUND') {
+                    // Send message indicating a successful build with the public app download URL
+                    slackSend channel: '#server-builds',
+                        color: '#73c990',
+                        message: "SUCCESS: <${env.BUILD_URL}|${currentBuild.fullDisplayName}>  build from ${INSTALLER_BRANCH} INSTALLER_BRANCH completed.\n" +
+                                "PUBLIC app download URL: <${env.URL_STRING}|${env.URL_STRING}>"
+                } else if (URL_STATUS == 'OK') {
+                    // Send message for E2E test success indicating that EXE is already published
+                    slackSend channel: '#server-builds',
+                        color: '#73c990',
+                        message: "SUCCESS: <${env.BUILD_URL}|${currentBuild.fullDisplayName}>  build from ${INSTALLER_BRANCH} INSTALLER_BRANCH completed.\n" +
+                                "PUBLIC app download URL: EXE already published in azure repo "
+                }
+            }
+    }
+        failure {
+            slackSend channel: '#server-builds',
+                color: '#d54c53',
+                message: "FAILURE: <${env.BUILD_URL}|${currentBuild.fullDisplayName}>  build from ${INSTALLER_BRANCH} INSTALLER_BRANCH failed.\n"
+        }
+    }  
+}
+
+
