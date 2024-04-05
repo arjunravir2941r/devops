@@ -1,0 +1,113 @@
+#!groovy
+
+pipeline {
+
+    agent { label 'java17' }
+
+    environment {
+        DIRECTORY = 't6-admin'
+        COMMIT_MESSAGES = ''
+        LATEST_TAG = ''
+        AWS_REGION = "us-east-1" 
+        AWS_CREDENTIALS_Jenkins=credentials('aws-creds')
+        AWS_ACCOUNT_ID = '404678654041'
+    }
+
+    options {
+        checkoutToSubdirectory "t6-admin"
+        ansiColor('xterm')
+    }
+    tools {
+        jdk 'java17'
+    }
+
+    stages {
+
+        stage('Configure Git attributes') {
+            steps {
+                sh script: 'git config --global user.email "jenkins@t6hs.com"'
+                sh script: 'git config --global user.name "Jenkins"'
+            }
+        }
+
+        stage('Get Changeset') {
+            steps {
+                dir("$DIRECTORY") {
+                    script {
+                        AUTHOR = sh script: "git show -s --pretty=\"%an <%ae>\" ${GIT_COMMIT}", returnStdout: true
+                        COMMIT_MESSAGES = sh script: "git log --pretty=format:'%h - %an, %ar : %s <br>' --after=3.day", returnStdout: true
+                    }
+                }
+            }
+        }
+
+        stage('Start Build Notification') {
+            steps {
+                slackSend channel: '#backend-releases',
+                    color: '#4a6785',
+                    message: "STARTING: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> started."
+                        
+            }
+        }
+
+
+        stage('Setting Gradle Wrapper permissions') {
+            steps {
+                dir("$DIRECTORY") {
+                    sh 'chmod 777 gradlew'
+                }
+            }
+        }
+
+        stage('Gradle Release') {
+            steps {
+                sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                    dir("$DIRECTORY") {
+                        script {
+                            LATEST_TAG = sh script: './gradlew -q getVersion', returnStdout: true
+                            LATEST_TAG = LATEST_TAG.trim().replace('-SNAPSHOT', '')
+                            sh './gradlew release -x test -Prelease.useAutomaticVersion=true'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Git merge master into develop') {
+            steps {
+                sshagent(credentials: ['Jenkins-Gitlab-Service-Account']) {
+                    dir("$DIRECTORY") {
+                        sh 'git checkout develop'
+                        sh 'git merge origin/master'
+                        sh 'git pull'
+                        sh 'git push'
+                    }
+                }
+            }
+        }
+
+        stage('Starting Docker Image Build Job'){
+            steps{
+                build job: 't6-admin-docker-image', parameters: [string(name: 'TAG', value: LATEST_TAG)], wait: false
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend channel: '#backend-releases',
+                    color: '#73c990',
+                    message: "SUCCESS: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> completed.\n" +
+                            "Was completed and a new artifact was generated with version: ${LATEST_TAG}" 
+                            
+        }
+        failure {
+
+            slackSend channel: '#backend-releases',
+                    color: '#d54c53',
+                    message: "FAILURE: Pipeline <${env.BUILD_URL}|${currentBuild.fullDisplayName}> failed.\n"
+
+
+        }
+    }
+}
