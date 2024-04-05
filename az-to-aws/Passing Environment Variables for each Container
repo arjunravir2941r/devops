@@ -1,0 +1,49 @@
+Documentation for passing environment variables from S3 buckets to containers (admin, ws and central) in the AWS ECS Task Definition.
+
+FYI: Currently all the environment variable files are in GitLab and should be uploaded to s3 buckets for task definition to use.
+
+To specify different environment variable files for each container in an AWS ECS Task Definition, we would include the environmentFiles parameter within each container's definition in the task definition. Here's a general approach:
+
+Prepare Different Environment Files: Ensure we have separate .env files for each container, stored in Amazon S3.
+
+Task Definition: In the task definition JSON, under containerDefinitions, specify the environmentFiles for each container individually.
+
+Deploy Task Definition: Use this task definition to launch our ECS tasks. Each container will pull its specific environment variables from the designated S3 file.
+
+Remember to ensure that the task execution role has the necessary permissions to access these S3 files. Each .env file must adhere to the formatting requirements mentioned earlier.
+
+JSON format : 
+
+
+
+{
+  "family": "your-task-family",
+  "containerDefinitions": [
+    {
+      "name": "container1",
+      "image": "image-for-container1",
+      "environmentFiles": [
+        {
+          "value": "arn:aws:s3:::s3_bucket_name/container1.env",
+          "type": "s3"
+        }
+      ]
+      ...
+    },
+    {
+      "name": "container2",
+      "image": "image-for-container2",
+      "environmentFiles": [
+        {
+          "value": "arn:aws:s3:::s3_bucket_name/container2.env",
+          "type": "s3"
+        }
+      ]
+      ...
+    }
+    // Repeat for other containers
+  ]
+}
+Open image-20231120-201347.png
+image-20231120-201347.png
+Ref : https://docs.aws.amazon.com/AmazonECS/latest/developerguide/taskdef-envfiles.html
