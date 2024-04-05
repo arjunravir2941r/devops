@@ -1,0 +1,294 @@
+@Library(['sortVersions', 'getChanges']) _
+
+// Define a global variable at the top of your pipeline
+def stageFailure = false
+
+def determineNode() {
+    switch(params.UI_TEST_PIPELINE) {
+        case 'UITests-FrontendApp-QABackendServers':
+            return 'Cucumber'
+        case 'UITests-FrontendApp-LocalBackendInstaller':
+            return 'AZURE'
+    }
+}
+
+pipeline {
+    agent { node determineNode() }
+
+    parameters {
+        string(name: 'WEB_UI_TEST_BRANCH', defaultValue: 'master', description: 'Enter the WEB_UI_TEST_BRANCH')
+        choice(
+            choices: ['UITests-FrontendApp-QABackendServers', 'UITests-FrontendApp-LocalBackendInstaller'],
+            description: 'Select the test pipeline',
+            name: 'UI_TEST_PIPELINE'
+        )
+        choice(  
+            name: 'selectserver',
+            choices: ['qa1', 'qa2', 'qa3', 'qa4', 'qa5'],
+            description: "Server to make changes\nApplicable in future, Currently not needed"
+        )
+        string(name: 'ELECTRON_EXE_FULL_PATH', defaultValue: 'C:/Trauma Advanced Care/Trauma Advanced Care.exe', description: 'Path to electron EXE file to test')
+    }
+
+    environment {
+        DIRECTORY = 'ui-tests'
+        MIRTH_CHANNEL_DIRECTORY = 'hl7-mirth-channels'
+        MIRTH_CHANNEL_BRANCH = "master"
+        DIR_NAME = "ui-tests-${env.BUILD_NUMBER}"
+    }
+
+    options {
+        checkoutToSubdirectory 'web-ui-test'
+        ansiColor('xterm')
+        timestamps()
+    }
+
+    stages {
+        stage('Send Start Build Notification') {
+            steps {
+                slackSend(
+                    channel: '#frontend-testing',
+                    color: '#3399ff',
+                    message: "STARTING: Pipeline ${currentBuild.fullDisplayName} (Build #${env.BUILD_NUMBER}) with UI Test Pipeline: ${params.UI_TEST_PIPELINE}\n" +
+                            "Pipeline info: <${env.BUILD_URL}| Jenkins >"
+                )
+            }
+        }
+
+        stage('Checkout web-ui-test project') {
+            steps {
+                script {
+                    println "Checking out ${WEB_UI_TEST_BRANCH}"
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${WEB_UI_TEST_BRANCH}"]],
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanCheckout'],
+                            [$class: 'RelativeTargetDirectory', relativeTargetDir: "${DIRECTORY}"]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@git.net.venuiti.com:T6/web-ui-automation.git']]
+                    ])
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir("$DIRECTORY") {
+                    bat 'yarn install --verbose'
+                    bat 'yarn install:deps --verbose'
+                }
+            }
+        }
+
+        stage('Install Client') {
+            steps {
+                dir("$DIRECTORY") {
+                    bat """
+                        set "ELECTRON_PATH=${ELECTRON_EXE_FULL_PATH}" && set "TAC_DISABLE_EXIT_POPUP=true" && yarn install:client
+                    """
+                }
+            }
+        }
+
+        stage('Install Server') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller'}
+            }
+            steps {
+                dir("$DIRECTORY") {
+                    bat 'yarn install:server --databaseName=TAC'
+                    bat 'yarn admin:create:users'
+                    
+                }
+            }
+        }
+
+        stage('Checkout Mirth Channels project ') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller'}
+            }
+            steps {
+                script {
+                    println "Checking out ${MIRTH_CHANNEL_BRANCH}"
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${MIRTH_CHANNEL_BRANCH}"]],  
+                        doGenerateSubmoduleConfigurations: false,
+                        extensions: [
+                            [$class: 'CleanCheckout'],
+                            [$class: 'RelativeTargetDirectory', relativeTargetDir: "${MIRTH_CHANNEL_DIRECTORY}"]
+                        ],
+                        submoduleCfg: [],
+                        userRemoteConfigs: [[credentialsId: 'Jenkins-Gitlab-Service-Account', url: 'git@git.net.venuiti.com:T6/hl7-mirth-channels.git']]
+                    ])
+                }
+            }
+        }
+
+        stage('Build Mirth Channels') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller'}
+            }
+            steps {
+                dir("$MIRTH_CHANNEL_DIRECTORY") {
+                    bat 'npm install && npm start'
+                }
+            }
+        }
+
+        stage('Install Mirth') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller'}
+            }
+            steps {
+                dir("$DIRECTORY") {
+                    bat 'set "TAC_DISABLE_EXIT_POPUP=true" && yarn install:mirth'
+                }
+            }
+        }
+
+
+        stage('Run Client Tests with LocalBackendInstaller') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller' }
+            }
+            steps {
+                dir("${DIRECTORY}") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        script {
+                            stageFailure = true
+                            echo "Value of stageFailure: ${stageFailure}"
+                        }
+                        bat 'set "TAC_DISABLE_EXIT_POPUP=true" && yarn electron:test:run'
+                        
+                    }
+                }
+            }
+        }
+
+
+        stage('Run Admin Tests with LocalBackendInstaller') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller' }
+            }
+            steps {
+                dir("${DIRECTORY}") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        script {
+                            stageFailure = true
+                            echo "Value of stageFailure: ${stageFailure}"
+                        }
+
+                        bat 'set "TAC_DISABLE_EXIT_POPUP=true" && yarn admin:tests:localhost'
+                        
+                    }
+                }
+            }
+        }
+
+        stage('Run Mirth Tests with LocalBackendInstaller') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-LocalBackendInstaller' }
+            }
+            steps {
+                dir("${DIRECTORY}") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        script {
+                            stageFailure = true
+                            echo "Value of stageFailure: ${stageFailure}"
+                        }
+                        bat 'yarn run:test:mirth'
+                        
+                    }
+                }
+            }
+        }
+
+        stage('Run Client Tests with UITests-FrontendApp-QABackendServers') {
+            when {
+                expression { params.UI_TEST_PIPELINE == 'UITests-FrontendApp-QABackendServers'}
+            }
+            steps {
+                dir("$DIRECTORY") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        script {
+                            stageFailure = true
+                            echo "Value of stageFailure: ${stageFailure}"
+                        }
+                       
+                            bat 'set "TAC_DISABLE_EXIT_POPUP=true" && yarn electron:test:run'   
+                    
+                    
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                if (stageFailure) {
+                    currentBuild.result = 'FAILURE'
+                    echo "Post-Action: Failures detected during the pipeline execution."
+                } else {
+                    echo "Post-Action: No failures detected."
+                }
+            }
+        }
+
+        failure {
+            script {
+                dir("$DIRECTORY") {
+                    bat "allure generate -c allure-results -o ${DIR_NAME}"
+                    if (fileExists("${DIR_NAME}")) {
+                        withCredentials([string(credentialsId: 'sasToken', variable: 'sasToken')]) {
+                            bat "az storage blob upload-batch --account-name t6hsfilesinstallers -d web-ui-qa --destination-path ${DIR_NAME} --source ${DIR_NAME} --sas-token \"%sasToken%\" "
+                        }
+                    } else {
+                        echo "Directory ${DIR_NAME} does not exist"
+                        currentBuild.result = 'FAILURE'
+                    }
+
+                    // Send a Slack notification for any failure, regardless of stageFailure
+                    slackSend(
+                        channel: '#frontend-testing',
+                        color: '#E0322F',
+                        message: "FAILURE: Pipeline ${currentBuild.fullDisplayName} with pipeline type: ${params.UI_TEST_PIPELINE} encountered a failure.\n" +
+                                "See test results at: https://t6hsfilesinstallers.blob.core.windows.net/web-ui-qa/${DIR_NAME}/index.html\n" +
+                                "Pipeline info: <${env.BUILD_URL}| Jenkins >"
+                    )
+                }
+            }
+        }
+
+
+        success {
+            script {
+                dir("$DIRECTORY") {
+                    bat "allure generate -c allure-results -o ${DIR_NAME}"
+                    if (fileExists("${DIR_NAME}")) {
+                        withCredentials([string(credentialsId: 'sasToken', variable: 'sasToken')]) {
+                            bat "az storage blob upload-batch --account-name t6hsfilesinstallers -d web-ui-qa --destination-path ${DIR_NAME} --source ${DIR_NAME} --sas-token \"%sasToken%\" "
+                        }
+                    } else {
+                        echo "Directory ${DIR_NAME} does not exist"
+                        currentBuild.result = 'FAILURE'
+                    }
+
+                    slackSend(
+                        channel: '#frontend-testing',
+                        color: '#12B371',
+                        message: "SUCCESS: Pipeline ${currentBuild.fullDisplayName} succeeded with pipeline type: ${params.UI_TEST_PIPELINE}.\n" +
+                                "See test results at: https://t6hsfilesinstallers.blob.core.windows.net/web-ui-qa/${DIR_NAME}/index.html\n" +
+                                "Pipeline info: <${env.BUILD_URL}| Jenkins >"
+                    )
+                }
+            }
+        }
+    }
+}
