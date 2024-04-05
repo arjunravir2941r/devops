@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# Update the system
+yum update -y
+
+# Install Java 17 JDK using Amazon Corretto
+yum install -y java-17-amazon-corretto-devel
+
+# Verify Java installation
+java -version
+
+# Create new user t6admin and add to wheel group for sudo access
+useradd -m t6admin
+echo 't6admin ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/t6admin
+
+# Ensure SSH directory exists for t6admin
+mkdir -p /home/t6admin/.ssh
+chmod 700 /home/t6admin/.ssh
+chown t6admin:t6admin /home/t6admin/.ssh
+
+# Add authorized_keys for SSH access with the provided keys
+cat <<EOF > /home/t6admin/.ssh/authorized_keys
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCc6W/XFSvhfGAoT/4iqnW2w9A+KvZi2izcSyKs+fzNhDpiwVfYVTsq8omB+Fjls7um81z+uMBvBuw7afRGiBsFkxY+cC68O+7aUICMEWjWwv6UEsIcs6yvcMz5dy+pymcC8c4BGkfU01ZRl0M8YMU5CTlyBI0VnlVl6ln1lxGJUGpQOTMc0oncugQ2YpPO38t7RJwjvZHVSB+tx6RTp9tKeVLkud5s+c1iAQ4d6u3n8FgGhk1i2FGbz8N6amD7OS2WlEmf3MLwSLgVc0ahQgZ4gHyLWAq3LwakS+zAnRGJkvcN9YbMOdDmLaXnEJaunVq+zzEyV6o0cLfobN1NHqv/KWL/1fJS3+ZKznyz+7DCmC+ApqlYbtVXel+OmPh/ySbwxY5Gl8dy3xEzr09PLrLmw9sYteCvfziG5leEJfsHBJG5/qneMFrUdj+QOUq/Jf6ponB9hFQCdJET7mIsKqrib3bUssVVlPHjJUety0JDltxpOyXodXHD6r3DS32SU7TZKNL+gPuX4UaY7eY3l2YbWilJ9H1TXAG7nnSVc37EvW7CdkSeOAtmiRUCi9lR5Ldh/1F5PFbQxhKEtMvOhRxRA3fPcoY2rXEg6dA2QP2dqEjaFCr0WRl6arBFum3LPF52Zy+dA9iZzpAmw1OSFpPYdz+VApW5kjY/vQ67yZkGrw==
+
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCmZyOcWqo+TX4e67nMpN2NcENgh91S30uXGvcdH4CQj30TqPkZCr+pTTyaEiGSJjzTHvp0d72A/0QZo5olyh23SJL9opmxB+kx4V+wEu7agk0KHG4ORrRiOTo8652f8cOK80cKicFbzgozvcyHCjiHv1EhtbjMMZiSepEHoflmOPvNjA6cALEBFib0MV+v9SHGVIkZ+vK+Mhe8sDwQTlV1C8FVPhFzPQtRN7LJkkyp0fXb5HCChHXVt1/48ippnaATZ1MgPpkJjY0TaIADxrBflni9bJeFH8KSaCP/IZDAJtZzPz/lvkz7ZyqHAfvNK90w9EFDtnyOOW0lrwmizEtHZOwXo7BYet+Klf+UtHwTyEaA11JKs4yLNa3iLuepvFLuYRecYTKL8wJfksqWzeug9To0gYf1tNzPoqMrwiYFy5aBgzdtsa0iVSUhWnV2ZvwfLZG3fmPnANEYcnONic/OYoIYJ0jklHY3dwJbXstfoPJEd8PMXiwwv4NJ2ogKNWE=
+
+EOF
+
+# Set the correct permissions for the authorized_keys file
+chmod 600 /home/t6admin/.ssh/authorized_keys
+
+# Change ownership of the .ssh directory and its contents to t6admin
+chown -R t6admin:t6admin /home/t6admin/.ssh
