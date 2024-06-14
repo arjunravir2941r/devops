@@ -1,0 +1,149 @@
+main_fargate.tf :
+
+module "container" {
+  source       = "./modules/container_fargate"
+  name         = var.cluster.name
+  cluster_name = var.cluster.name
+  task_count   = var.cluster.desired_capacity
+
+  ecs_execution_role_arn = var.container.ecs_execution_role_arn
+  ecs_task_role_arn      = var.container.ecs_task_role_arn
+
+  t6cs_config_secret_aws_region = var.container.t6cs_config_secret_aws_region
+  t6cs_config_secret_id         = var.container.t6cs_config_secret_id
+
+  t6cs_container_image_name  = "${var.t6cs_ecr_registry.base_uri}/${var.container.t6cs_container_image_name}"
+  t6cs_container_tls_mode    = var.container.t6cs_container_tls_mode
+  mirth_container_image_name = "${var.t6cs_ecr_registry.base_uri}/${var.container.mirth_container_image_name}"
+  subnet_ids                 = var.cluster.subnet_ids
+  vpc_id                     = var.cluster.vpc_id
+  ecr_repositories           = var.t6cs_ecr_registry.arns
+  certificate = {
+    key_arn                         = var.container.secret_key_arn
+    cert_arn                        = var.container.secret_certificate_arn
+    mutual_tls_opt_root_ca_cert_arn = var.container.mutual_tls_optional_root_ca_cert_arn
+  }
+
+  mirth_db_connection_string = var.container.mirth_db_connection_string
+  mirth_volume_efs_id        = var.container.mirth_volume_efs_id
+  t6cs_db_connection_string  = var.container.t6cs_db_connection_string
+
+  database_credentials_secret_arn = var.container.database_credentials_secret_arn
+
+}
+
+outputs.tf:
+
+output "lb_dns_name" {
+  description = "DNS name of the LB"
+  value       = module.container.lb_dns_name
+}
+
+
+providers.tf:
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.8.0"
+    }
+  }
+}
+
+provider "aws" {
+  profile = "default"
+  region  = "us-east-1"
+}
+
+terraform.tfvars:
+
+t6cs_ecr_registry = {
+  base_uri = "851725358393.dkr.ecr.us-east-1.amazonaws.com"
+  arns = [
+    "arn:aws:ecr:us-east-1:851725358393:repository/mirthconnect",
+    "arn:aws:ecr:us-east-1:851725358393:repository/t6cs"
+  ]
+}
+cluster = {
+  name     = "T6-CS-ECS-Cluster"
+  key_name = "t6-cs-ecs-cluster"
+  vpc_id   = "vpc-0ae78701f09645b0a"
+  subnet_ids = [
+    "subnet-0e9db999e406c7f66",
+    "subnet-08bde163910cd2da9"
+  ]
+  instance_type    = "t3.micro"
+  min_instances    = 1
+  max_instances    = 4
+  desired_capacity = 1
+}
+container = {
+  ecs_execution_role_arn               = "arn:aws:iam::851725358393:role/ecsTaskExecutionRole"
+  ecs_task_role_arn                    = "arn:aws:iam::851725358393:role/ecsTaskExecutionRole"
+  t6cs_config_secret_aws_region        = "us-east-1"
+  t6cs_config_secret_id                = "t6cs/application-config"
+  t6cs_container_image_name            = "t6cs:1.0.53.1"
+  t6cs_container_tls_mode              = "mutual"
+  t6cs_db_connection_string            = "jdbc:postgresql://database-1.ctis2cayqu9g.us-east-1.rds.amazonaws.com:5432/t6cs-db"
+  mirth_container_image_name           = "mirthconnect:4.5.0.1"
+  mirth_volume_efs_id                  = "fs-00e74783195902b32"
+  mirth_db_connection_string           = "jdbc:postgresql://database-1.ctis2cayqu9g.us-east-1.rds.amazonaws.com:5432/mirth-db"
+  secret_certificate_arn               = "arn:aws:secretsmanager:us-east-1:851725358393:secret:t6cs/t6cs-container/https-cert-YwpTsi"
+  secret_key_arn                       = "arn:aws:secretsmanager:us-east-1:851725358393:secret:t6cs/t6cs-container/https-key-uXgyXA"
+  mutual_tls_optional_root_ca_cert_arn = "arn:aws:secretsmanager:us-east-1:851725358393:secret:t6cs/t6cs-container/https-cert-YwpTsi"
+  database_credentials_secret_arn      = "arn:aws:secretsmanager:us-east-1:851725358393:secret:t6cs/dbAccessCert-BW8ERl"
+}
+
+
+variables.tf:
+
+variable "t6cs_ecr_registry" {
+  default = {
+    base_uri = "732034177186.dkr.ecr.us-east-1.amazonaws.com"
+    arns = ["arn:aws:ecr:us-east-1:732034177186:repository/mirthconnect",
+      "arn:aws:ecr:us-east-1:732034177186:repository/t6cs"
+    ]
+  }
+}
+
+variable "cluster" {
+  default = {
+    name             = "CHANGE_ME_cluster_name"
+    key_name         = "CHANGE_ME_cluster_key_name"
+    vpc_id           = "vpc-0d7642085a3ac21b5"
+    subnet_ids       = ["subnet-0fa53438cc66afdf9", "subnet-0f47fdfa359adf352"]
+    instance_type    = "t3.micro"
+    min_instances    = 1
+    max_instances    = 1
+    desired_capacity = 1
+  }
+}
+
+variable "container" {
+  default = {
+    ecs_execution_role_arn = "arn:aws:iam::404678654041:role/T6-CS-ECS-TaskExecutionRole"
+    ecs_task_role_arn      = "arn:aws:iam::404678654041:role/T6-CS-ECS-TaskExecutionRole"
+
+    t6cs_config_secret_aws_region = "us-gov-west-1"
+    t6cs_config_secret_id         = "t6cs/application-config"
+
+    t6cs_container_image_name = "t6cs:1.0.5.2-bundle-2.6"
+    t6cs_container_tls_mode   = "server"
+    t6cs_db_connection_string = ""
+
+    mirth_container_image_name = "mirthconnect:4.3"
+    mirth_db_connection_string = ""
+    mirth_volume_efs_id        = ""
+
+    secret_certificate_arn               = "arn:aws:secretsmanager:us-east-1:684331431821:secret:t6cs/nginx/public_cert-YWcfsB"
+    secret_key_arn                       = "arn:aws:secretsmanager:us-east-1:684331431821:secret:t6cs/nginx/private_key-pRtysm"
+    mutual_tls_optional_root_ca_cert_arn = "arn:aws:secretsmanager:us-east-1:684331431821:secret:t6cs/nginx/public_cert-YWcfsB"
+    database_credentials_secret_arn      = "arn:aws:secretsmanager:us-east-1:684331431821:secret:t6cs/databaseAccess-ocvnBQ"
+  }
+}
+
+
+
+
+
