@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for CloudWatch alarms to notify via Slack
+
+Parameters:
+  SlackWebhookURL:
+    Description: The Slack Webhook URL for notifications
+    Type: String
+    Default: "https://hooks.slack.com/services/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"
+
+Resources:
+  # SNS Topic for Slack Notifications
+  SlackNotificationTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref SlackWebhookURL
+          Protocol: "https"
+      TopicName: "SlackNotificationTopic"
+
+  # Lambda Function to send notifications to Slack
+  CloudWatchAlarmHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const url = require('url');
+
+          exports.handler = async (event) => {
+              const slackWebhookUrl = process.env.SLACK_WEBHOOK_URL;
+
+              const message = JSON.parse(event.Records[0].Sns.Message);
+
+              const slackMessage = {
+                  text: message.AlarmName + " triggered: " + message.NewStateReason
+              };
+
+              const slackOptions = {
+                  method: 'POST',
+                  headers: {
+                      'Content-Type': 'application/json'
+                  }
+              };
+
+              return new Promise((resolve, reject) => {
+                  const req = https.request(url.parse(slackWebhookUrl), slackOptions, (res) => {
+                      let response = '';
+                      res.on('data', (chunk) => {
+                          response += chunk;
+                      });
+                      res.on('end', () => {
+                          resolve(response);
+                      });
+                  });
+
+                  req.on('error', (error) => {
+                      reject(error);
+                  });
+
+                  req.write(JSON.stringify(slackMessage));
+                  req.end();
+              });
+          };
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookURL
+
+  # IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SlackNotificationTopic
+  
+  # Alarms for testVM
+  testVMCPUUtilizationAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: "Alarm if CPU utilization exceeds 90% for testVM"
+      Namespace: "AWS/EC2"
+      MetricName: "CPUUtilization"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: "i-0752e2ce97687061e"
+      Statistic: "Average"
+      Period: "300"
+      EvaluationPeriods: "1"
+      Threshold: "20"
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref SlackNotificationTopic
+
+  testVMMemoryUtilizationAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: "Alarm if memory utilization exceeds 90% for testVM"
+      Namespace: "CWAgent"
+      MetricName: "mem_used_percent"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: "i-0752e2ce97687061e"
+      Statistic: "Average"
+      Period: "300"
+      EvaluationPeriods: "1"
+      Threshold: "20"
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref SlackNotificationTopic
+
+  testVMDiskSpaceUtilizationAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmDescription: "Alarm if disk space utilization exceeds 20% for testVM"
+      Namespace: "CWAgent"
+      MetricName: "disk_used_percent"
+      Dimensions:
+        - Name: "InstanceId"
+          Value: "i-0752e2ce97687061e"
+        - Name: "path"
+          Value: "/"
+        - Name: "device"
+          Value: "xvda1"
+        - Name: "fstype"
+          Value: "xfs"
+      Statistic: "Average"
+      Period: "300"
+      EvaluationPeriods: "1"
+      Threshold: "20"
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref SlackNotificationTopic
+
+Outputs:
+  CPUUtilizationAlarmName:
+    Description: "Name of the CPU Utilization Alarm"
+    Value: !Ref testVMCPUUtilizationAlarm
+
+  MemoryUtilizationAlarmName:
+    Description: "Name of the Memory Utilization Alarm"
+    Value: !Ref testVMMemoryUtilizationAlarm
+
+  DiskSpaceUtilizationAlarmName:
+    Description: "Name of the Disk Space Utilization Alarm"
+    Value: !Ref testVMDiskSpaceUtilizationAlarm
